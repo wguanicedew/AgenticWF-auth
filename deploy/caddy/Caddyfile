@@ -1,0 +1,16 @@
+# /etc/caddy/Caddyfile — the same main file for every AgenticWF layout.
+#
+# The layout is chosen by installing exactly ONE site file from deploy/caddy/sites/ into
+# /etc/caddy/Caddyfile.d/:
+#
+#   agenticwf-single-host.caddyfile  one hostname, port 443 only (Logto at /, app at /app/)
+#   agenticwf-multi-host.caddyfile   separate hostnames for Logto, admin console and app
+#
+# The EL9 `caddy` package's default /etc/caddy/Caddyfile already ends with the same
+# import, so you can keep that file instead of this one.
+#
+# Site files take their hostnames from Caddy's process environment (AGENTICWF_*), see
+# docs/deployment.md §3. Validate with that environment loaded:
+#   sudo bash -c 'set -a; . /etc/caddy/agenticwf.env; caddy validate --config /etc/caddy/Caddyfile'
+
+import Caddyfile.d/*.caddyfile

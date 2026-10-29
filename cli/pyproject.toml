@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agenticwf-auth-client"
+version = "0.1.0"
+description = "AgenticWF client: the `agenticwf` command (Logto sign-in, tokens, API calls; `kb` and `agent` commands from their client packages)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []  # standard library only
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+agenticwf = "agenticwf_auth_cli.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

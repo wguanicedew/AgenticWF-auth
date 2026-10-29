@@ -1,0 +1,111 @@
+# Route authorization policy for the auth service (authsvc).
+#
+# Evaluated by /verify for every request Caddy forwards to the application.
+# First matching rule wins; requests matching no rule are denied.
+#
+# Rule keys:
+#   path           pattern; `*` = one segment, `**` = any remainder (last segment only)
+#   methods        list of HTTP methods (default: any)
+#   public         true -> no token needed (a valid token still yields an AuthContext)
+#   authenticated  true -> any valid token (documentation only; implied by non-public rules)
+#   scopes         all of these Logto API scopes are required
+#   roles_any      at least one role required (needs the `roles` custom JWT claim)
+#   organization   true -> token must be organization-scoped (carries an org id)
+#   allow_machine  false -> reject machine-to-machine (client credentials) tokens
+#   allow_pending  true  -> skip `required_scopes` (reachable before approval)
+#
+# Scopes are defined on the Logto API resource (e.g. https://api.example.com) and
+# granted to users through Logto RBAC roles.
+
+# Credentials: CLI/scripts send `Authorization: Bearer`; browsers use the session cookie
+# from /auth/login (routed by Caddy to authsvc, never through this policy).
+
+# Account approval: every non-public route also needs these scopes. `app:access` is part
+# of every Logto role (researcher, admin, M2M roles); a newly registered user has no role,
+# so the token lacks it and requests get 403 approval_pending (browsers see an
+# "awaiting approval" page) until an admin assigns a role. See docs/deployment.md §4.2.
+required_scopes: [app:access]
+
+rules:
+  - path: /healthz
+    public: true
+
+  # --- Browser pages (unauthenticated page loads are redirected to /auth/login) ---
+  - path: /
+    methods: [GET, HEAD]
+    authenticated: true
+
+  # The agent's admin page (AgenticWF-agent): task types and models; everyone manages their own.
+  - path: /admin
+    methods: [GET, HEAD]
+    authenticated: true
+
+  - path: /static/**
+    methods: [GET, HEAD]
+    public: true
+
+  # --- Live status / updates (Server-Sent Events; WebSockets live under sessions) ---
+  - path: /api/v1/events
+    methods: [GET]
+    authenticated: true
+
+  - path: /api/v1/me
+    methods: [GET]
+    authenticated: true
+    allow_pending: true        # "whoami" works before approval
+
+  - path: /api/v1/search
+    methods: [GET]
+    scopes: [knowledge:read]
+
+  - path: /api/v1/datasets/**
+    methods: [GET, HEAD]
+    scopes: [dataset:read]
+
+  - path: /api/v1/datasets/**
+    methods: [POST, PUT, PATCH, DELETE]
+    scopes: [dataset:write]
+
+  - path: /api/v1/compute/**
+    methods: [POST]
+    scopes: [compute:submit]
+    organization: true
+
+  - path: /api/v1/sessions/**
+    scopes: [agent:use]
+    allow_machine: false
+
+  # Task types and models: everyone reads what they may use; people manage their own
+  # (AgenticWF-agent docs/admin-page.md). Writes first: the first matching rule wins.
+  - path: /api/v1/task-types/**
+    methods: [PUT, DELETE]
+    scopes: [agent:use]
+    allow_machine: false
+
+  - path: /api/v1/task-types/**
+    methods: [GET]
+    scopes: [agent:use]
+
+  - path: /api/v1/models/**
+    methods: [POST, PATCH, DELETE]
+    scopes: [agent:use]
+    allow_machine: false
+
+  - path: /api/v1/models/**
+    methods: [GET]
+    scopes: [agent:use]
+
+  # Approving a tool call of an agent task: people only (machines can never approve).
+  # Above the broader /api/v1/tasks/** rule: the first matching rule wins.
+  - path: /api/v1/tasks/*/approvals/**
+    methods: [POST]
+    scopes: [agent:use]
+    allow_machine: false
+
+  # Background tasks of the agent container (AgenticWF-agent); M2M clients allowed.
+  - path: /api/v1/tasks/**
+    scopes: [agent:use]
+
+  - path: /api/v1/admin/**
+    scopes: [admin]
+    allow_machine: false

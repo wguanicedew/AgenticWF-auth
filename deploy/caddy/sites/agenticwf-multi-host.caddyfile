@@ -1,0 +1,113 @@
+# AgenticWF sites, SEPARATE hostnames (Logto, Logto admin console, application).
+# Install exactly ONE AgenticWF site file into /etc/caddy/Caddyfile.d/ (imported by
+# /etc/caddy/Caddyfile, see ../Caddyfile):
+#   cp deploy/caddy/sites/agenticwf-multi-host.caddyfile /etc/caddy/Caddyfile.d/
+#
+# The container listens on 127.0.0.1 only:
+#   127.0.0.1:3001  Logto (OIDC endpoints, sign-in UI)
+#   127.0.0.1:3002  Logto admin console
+#   127.0.0.1:8010  authsvc  (forward_auth target, browser login)
+#   127.0.0.1:8000  REST / agent API (backend)
+#
+# Placeholders come from Caddy's own process environment (no defaults on purpose; see
+# docs/deployment.md §3), e.g. in /etc/caddy/agenticwf.env:
+#   AGENTICWF_ACME_EMAIL=ops@example.org
+#   AGENTICWF_LOGTO_HOST=auth.example.org
+#   AGENTICWF_LOGTO_ADMIN_HOST=auth-admin.example.org
+#   AGENTICWF_APP_HOST=app.example.org
+#   AGENTICWF_ADMIN_ALLOWED_CIDRS="10.0.0.0/8 192.168.0.0/16"
+#
+# Container env to match:
+#   LOGTO_ENDPOINT=https://<AGENTICWF_LOGTO_HOST>
+#   LOGTO_ADMIN_ENDPOINT=https://<AGENTICWF_LOGTO_ADMIN_HOST>
+#   APP_ORIGIN=https://<AGENTICWF_APP_HOST>   APP_BASE_PATH=
+
+(agenticwf_common) {
+	# Certificate via ACME; for a host certificate replace with
+	#   tls /etc/caddy/certs/hostcert.pem /etc/caddy/certs/hostkey.pem
+	tls {$AGENTICWF_ACME_EMAIL}
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+	log {
+		output stdout
+		format json
+	}
+}
+
+# Tracing (docs/deployment.md §3, Tracing). Trace context from clients is never trusted: Caddy starts
+# each trace, so a client cannot join, flood or force-sample the collector's traces. The `tracing`
+# directive itself is opt-in: it is in /etc/caddy/tracing.d/ (deploy/caddy/tracing/), and an empty
+# or missing directory only makes Caddy log "No files matching import glob pattern" once per load.
+(agenticwf_trace) {
+	request_header -traceparent
+	request_header -tracestate
+	request_header -baggage
+	import /etc/caddy/tracing.d/*.caddy
+}
+
+# --- Logto: sign-in, OIDC discovery, token and JWKS endpoints ---------------------
+{$AGENTICWF_LOGTO_HOST} {
+	import agenticwf_common
+	request_header -X-Auth-*
+	reverse_proxy 127.0.0.1:3001
+}
+
+# --- Logto admin console: restricted to operator networks --------------------------
+{$AGENTICWF_LOGTO_ADMIN_HOST} {
+	import agenticwf_common
+	@outside not remote_ip {$AGENTICWF_ADMIN_ALLOWED_CIDRS}
+	respond @outside "Forbidden" 403
+	reverse_proxy 127.0.0.1:3002
+}
+
+# --- Application: REST API (CLI clients), browser chat UI, status/update streams -----
+#
+#   CLI / scripts : Authorization: Bearer <Logto access token>
+#   Browser       : __Host-agenticwf_session cookie, obtained via /auth/login
+#   SSE/WebSocket : same cookie; reverse_proxy streams both without extra settings
+{$AGENTICWF_APP_HOST} {
+	import agenticwf_common
+
+	# Browser login endpoints are served by authsvc itself (same origin => first-party cookie).
+	handle /auth/* {
+		route {
+			request_header -X-Auth-*
+			import agenticwf_trace
+			reverse_proxy 127.0.0.1:8010
+		}
+	}
+
+	# Everything else: authenticate + authorize every request with authsvc.
+	handle {
+		# `route` keeps the directives in exactly this order.
+		route {
+			# 1. Never trust identity headers supplied by the client.
+			request_header -X-Auth-*
+			import agenticwf_trace   # the span holds forward_auth and the backend call
+
+			# 2. Pre-check with authsvc. Caddy sends the original method/URI as
+			#    X-Forwarded-Method / X-Forwarded-Uri plus the client's Authorization,
+			#    Cookie, Origin and Upgrade headers. Non-2xx responses go to the client
+			#    unchanged: 401/403/503 JSON for API calls, 302 -> /auth/login for page loads.
+			forward_auth 127.0.0.1:8010 {
+				uri /verify
+				# The auth sub-request must stay a plain GET even for WebSocket handshakes;
+				# authsvc still sees the upgrade intent (for its Origin check).
+				header_up X-Forwarded-Upgrade {http.request.header.Upgrade}
+				header_up -Upgrade
+				header_up -Connection
+				copy_headers X-Auth-User-Id X-Auth-Client-Id X-Auth-Org-Id X-Auth-Roles X-Auth-Scopes X-Auth-Method X-Auth-Context X-Auth-Context-Sig
+			}
+
+			# 3. Forward to the backend with the verified identity headers.
+			#    Uncomment to stop the raw bearer token from reaching the backend:
+			# request_header -Authorization
+			reverse_proxy 127.0.0.1:8000
+		}
+	}
+}

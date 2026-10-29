@@ -1,0 +1,103 @@
+# AgenticWF site, ONE hostname and ONLY port 443.
+# Install exactly ONE AgenticWF site file into /etc/caddy/Caddyfile.d/ (imported by
+# /etc/caddy/Caddyfile, see ../Caddyfile):
+#   cp deploy/caddy/sites/agenticwf-single-host.caddyfile /etc/caddy/Caddyfile.d/
+#
+#   https://{$AGENTICWF_HOST}/            Logto (sign-in pages, /oidc, /callback, its /api, ...)
+#   https://{$AGENTICWF_HOST}/app/        application: chat UI, REST API, SSE, WebSocket
+#   https://{$AGENTICWF_HOST}/app/auth/*  browser login (authsvc)
+#   Logto admin console                   not exposed; use an SSH tunnel to 127.0.0.1:3002
+#
+# Logto OSS cannot run under a path prefix (it mounts its routes and a catch-all sign-in
+# app at "/"), so it owns the root and the application lives under /app. Caddy strips
+# /app, so authsvc, policy.yaml and the backend see plain /api/v1/... paths.
+#
+# Placeholders come from Caddy's own process environment, read when the config is loaded.
+# They have no defaults on purpose: if unset, Caddy refuses to load instead of silently
+# serving a wrong hostname. For the systemd service, see docs/deployment.md §3:
+#   AGENTICWF_HOST=host.example.org      public hostname
+#   AGENTICWF_ACME_EMAIL=ops@example.org contact for Let's Encrypt
+#
+# Container env to match:
+#   LOGTO_ENDPOINT=https://<AGENTICWF_HOST>   APP_ORIGIN=https://<AGENTICWF_HOST>
+#   APP_BASE_PATH=/app                         LOGTO_ADMIN_ENDPOINT=http://localhost:3002
+
+# Tracing (docs/deployment.md §3, Tracing). Trace context from clients is never trusted: Caddy starts
+# each trace, so a client cannot join, flood or force-sample the collector's traces. The `tracing`
+# directive itself is opt-in: it is in /etc/caddy/tracing.d/ (deploy/caddy/tracing/), and an empty
+# or missing directory only makes Caddy log "No files matching import glob pattern" once per load.
+(agenticwf_trace) {
+	request_header -traceparent
+	request_header -tracestate
+	request_header -baggage
+	import /etc/caddy/tracing.d/*.caddy
+}
+
+{$AGENTICWF_HOST} {
+	# Certificate, either:
+	#  a) ACME / Let's Encrypt via the TLS-ALPN challenge on 443 (port 80 not needed);
+	#     requires that the host is reachable from the internet on 443:
+	tls {$AGENTICWF_ACME_EMAIL}
+	#  b) or an existing host certificate (comment out the line above); the files must
+	#     be readable by the `caddy` user:
+	# tls /etc/caddy/certs/hostcert.pem /etc/caddy/certs/hostkey.pem
+
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+	log {
+		output stdout
+		format json
+	}
+
+	# The application's pages use relative URLs; make sure they resolve under /app/.
+	redir /app /app/ 308
+
+	# The bare hostname would land on Logto, which has no page at "/" (sign-in pages only
+	# work when an application starts a sign-in). Send people to the application instead.
+	# Exact match: only "/" itself, not Logto's other paths.
+	redir / /app/ 302
+
+	handle_path /app/* {
+		# Browser login endpoints (authsvc receives /auth/...).
+		handle /auth/* {
+			route {
+				request_header -X-Auth-*
+				import agenticwf_trace
+				reverse_proxy 127.0.0.1:8010
+			}
+		}
+
+		# Everything else in the application: authenticate + authorize with authsvc.
+		handle {
+			route {
+				# 1. Never trust identity headers supplied by the client.
+				request_header -X-Auth-*
+				import agenticwf_trace   # the span holds forward_auth and the backend call
+
+				# 2. Pre-check. X-Forwarded-Uri carries the path with /app already
+				#    stripped, which is what the policy and the backend use.
+				forward_auth 127.0.0.1:8010 {
+					uri /verify
+					header_up X-Forwarded-Upgrade {http.request.header.Upgrade}
+					header_up -Upgrade
+					header_up -Connection
+					copy_headers X-Auth-User-Id X-Auth-Client-Id X-Auth-Org-Id X-Auth-Roles X-Auth-Scopes X-Auth-Method X-Auth-Context X-Auth-Context-Sig
+				}
+
+				# 3. Backend (REST API, chat UI, SSE/WebSocket).
+				reverse_proxy 127.0.0.1:8000
+			}
+		}
+	}
+
+	# Everything else belongs to Logto (OIDC, sign-in UI, social callbacks, account center).
+	handle {
+		request_header -X-Auth-*
+		reverse_proxy 127.0.0.1:3001
+	}
+}

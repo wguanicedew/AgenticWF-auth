@@ -1,0 +1,21 @@
+# OPTIONAL: OpenTelemetry tracing in Caddy, for the AgenticWF site files (their `agenticwf_trace`
+# snippet imports /etc/caddy/tracing.d/*.caddy inside the application's routes).
+#
+# Enable:  sudo mkdir -p /etc/caddy/tracing.d
+#          sudo cp deploy/caddy/tracing/agenticwf-tracing.caddy /etc/caddy/tracing.d/
+#          and add the OTEL_* variables to /etc/caddy/agenticwf.env (docs/deployment.md §3, Tracing)
+# Disable: sudo rm /etc/caddy/tracing.d/agenticwf-tracing.caddy
+# Then:    sudo systemctl reload caddy
+#
+# Each request to the application becomes one trace rooted in Caddy. Caddy injects its span
+# context (W3C traceparent) into the request headers before the next handler, so both the
+# forward_auth call to authsvc /verify and the proxied call to the agent or the KB carry it, and
+# their spans are children of Caddy's.
+#
+# Caddy 2.6-2.10 (EL9's EPEL package is 2.6) export over OTLP/gRPC only and ignore
+# OTEL_TRACES_EXPORTER; 2.11 and later choose by OTEL_EXPORTER_OTLP_PROTOCOL (default http/protobuf).
+# OTEL_EXPORTER_OTLP_PROTOCOL=grpc with the collector's gRPC port (4317) works with both.
+
+tracing {
+	span caddy
+}

@@ -1,0 +1,41 @@
+# OPTIONAL add-on for the single-host layout (development): expose the Logto admin console
+# on a second port of the same hostname, restricted to operator networks.
+#
+#   https://{$AGENTICWF_HOST}:8443/  -> Logto admin console (127.0.0.1:3002)
+#
+# Enable:  cp deploy/caddy/sites/agenticwf-admin-console.caddyfile /etc/caddy/Caddyfile.d/
+# Disable: rm /etc/caddy/Caddyfile.d/agenticwf-admin-console.caddyfile
+# (alongside agenticwf-single-host.caddyfile; the multi-host layout has its own admin site)
+#
+# Logto only serves the admin console on the URL it is configured for, so the container
+# must use the same URL:
+#   LOGTO_ADMIN_ENDPOINT=https://<AGENTICWF_HOST>:8443
+# (http://localhost:3002 through an SSH tunnel keeps working as well).
+#
+# The port is written literally (edit both places to change it): an empty port placeholder
+# would silently merge this site into the main :443 site of the same hostname.
+# Caddy environment (no default on purpose):
+#   AGENTICWF_ADMIN_ALLOWED_CIDRS="188.184.0.0/15 2001:1458::/32"   # your networks
+# Port 8443 must also be open in the host firewall. The certificate is the one Caddy already
+# has for AGENTICWF_HOST. If AGENTICWF_ADMIN_ALLOWED_CIDRS is unset, everyone gets 403.
+
+{$AGENTICWF_HOST}:8443 {
+	tls {$AGENTICWF_ACME_EMAIL}
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+	log {
+		output stdout
+		format json
+	}
+
+	@outside not remote_ip {$AGENTICWF_ADMIN_ALLOWED_CIDRS}
+	respond @outside "Forbidden" 403
+
+	request_header -X-Auth-*
+	reverse_proxy 127.0.0.1:3002
+}
