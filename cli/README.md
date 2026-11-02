@@ -11,16 +11,22 @@ agenticwf whoami
 agenticwf call GET /api/v1/me
 ```
 
-Behind the AgenticWF server (Caddy, Logto) the commands sign in with `agenticwf login`; set the
-connection once (an administrator gets the values with
-`docker exec agenticwf cat /var/lib/agenticwf/logto/clients.env`):
+Behind the AgenticWF server (Caddy, Logto) the commands sign in with `agenticwf login`. The
+application URL is enough: authsvc publishes the rest at `<application URL>/auth/config`, and a
+service's URL works as well (`AGENTICWF_KB_URL`, `AGENTICWF_AGENT_URL`):
+
+```bash
+export AGENTICWF_API_URL=https://host.example.org/app
+agenticwf login
+```
+
+Variables that are set take precedence over what is published (an administrator gets the values
+with `docker exec agenticwf cat /var/lib/agenticwf/logto/clients.env`):
 
 ```bash
 export AGENTICWF_AUTH_URL=https://host.example.org
-export AGENTICWF_API_URL=https://host.example.org/app
 export AGENTICWF_CLIENT_ID=<Logto native app id>
 export AGENTICWF_RESOURCE=<API resource indicator>
-agenticwf login
 ```
 
 Scripts and CI use a personal access token instead (`AGENTICWF_TOKEN=pat_…`), or a machine

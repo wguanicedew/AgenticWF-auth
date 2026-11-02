@@ -176,7 +176,12 @@ def test_verify_carries_memberships(env, make_token):
     orgs.add_member(gid, "alice", [ROLES["member"]])
     memberships.forget("alice")   # what the group routes do after a change
     ctx = decode_context(*(alice.get("/verify", headers=headers).headers[h] for h in (HEADER_CONTEXT, HEADER_SIGNATURE)), SECRET)
-    assert ctx.organizations == {gid: "EIC"}
+    assert ctx.organizations == {gid: "EIC"} and ctx.managed_organizations == frozenset()
+    orgs.add_member(gid, "bob", [ROLES["member"], ROLES["admin"]])
+    bob_headers = {**headers, "Authorization": f"Bearer {make_token(sub='bob', scope='app:access agent:use knowledge:read')}"}
+    bob_ctx = decode_context(*(client("bob").get("/verify", headers=bob_headers).headers[h]
+                               for h in (HEADER_CONTEXT, HEADER_SIGNATURE)), SECRET)
+    assert bob_ctx.managed_organizations == {gid}      # bob administers the group: backends may let him approve for it
     assert alice.get("/whoami", headers={"Authorization": headers["Authorization"]}).json()["organizations"] == {gid: "EIC"}
 
     orgs.down = True              # Logto unreachable: the last known groups stay, requests still pass

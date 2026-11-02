@@ -124,6 +124,27 @@ account access yet. You will be able to continue once it has been approved.</p>
     return _no_store(HTMLResponse(body, status_code=403))  # type: ignore[return-value]
 
 
+def forbidden_page(base: str, uri: str, user: str, reason: str) -> HTMLResponse:
+    """403 page for a page load the signed-in user may not open (e.g. an admin-only tool);
+    API calls keep the JSON error."""
+    recheck = f"{base}/auth/recheck?return_to={quote(safe_return_to(f'{base}{uri}', base), safe='')}"
+    body = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Access denied</title>
+<style>body{{font:16px system-ui,sans-serif;max-width:560px;margin:4rem auto;padding:0 1rem;color:#222}}
+.box{{border:1px solid #ddd;border-radius:8px;padding:1.5rem}} a.button,button{{display:inline-block;padding:.5rem 1rem;
+margin-right:.5rem;border:1px solid #888;border-radius:6px;background:#f6f6f6;color:#222;text-decoration:none;font:inherit;cursor:pointer}}
+form{{display:inline}} .muted{{color:#666;font-size:.9rem}}</style></head><body><div class="box">
+<h1>You do not have access to this page</h1>
+<p>You are signed in as <strong>{html.escape(user)}</strong>, but your account lacks the permission
+this page needs. Ask an administrator for access if you need it.</p>
+<p class="muted">{html.escape(uri)}: {html.escape(reason)}</p>
+<p><a class="button" href="{html.escape(base)}/">Home</a><a class="button" href="{html.escape(recheck)}">Check again</a>
+<form method="post" action="{html.escape(base)}/auth/logout"><button>Sign out</button></form></p>
+</div></body></html>"""
+    return _no_store(HTMLResponse(body, status_code=403))  # type: ignore[return-value]
+
+
 def build_router(settings: Settings, sessions: SessionManager, client: LogtoClient, verifier: TokenVerifier,
                  required_scopes: frozenset[str] = frozenset()) -> APIRouter:
     router = APIRouter(prefix="/auth")

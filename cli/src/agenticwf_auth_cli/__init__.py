@@ -8,6 +8,7 @@
     base, token = service_access("kb", "/kb")    # a service's URL, and its tokens (refreshed)
 """
 
-from agenticwf_auth_cli.client import ApiError, AuthError, Client, Config, service_access
+from agenticwf_auth_cli.client import (ApiError, AuthError, Client, Config, describe, service_access,
+                                      sign_in_settings)
 
-__all__ = ["ApiError", "AuthError", "Client", "Config", "service_access"]
+__all__ = ["ApiError", "AuthError", "Client", "Config", "describe", "service_access", "sign_in_settings"]

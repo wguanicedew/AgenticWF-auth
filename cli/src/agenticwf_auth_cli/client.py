@@ -9,6 +9,10 @@ Credentials, in order of preference:
 
 `service_access` finds one service (kb, agent) for its client package: behind Caddy with the
 tokens above, or directly with the service's own token (a personal agent, a standalone KB).
+
+Only a URL is needed: a service publishes how it signs clients in at <its URL>/.well-known/agenticwf,
+and behind Caddy authsvc publishes the Logto settings (AGENTICWF_AUTH_URL, _API_URL, _CLIENT_ID,
+_RESOURCE) at <application URL>/auth/config. Variables that are set take precedence.
 """
 
 from __future__ import annotations
@@ -30,6 +34,9 @@ DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
 TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange"
 PAT_TOKEN_TYPE = "urn:logto:token-type:personal_access_token"
 EXPIRY_MARGIN = 60
+WELL_KNOWN = "/.well-known/agenticwf"   # a service's: {service, mode, auth, base_path, token_help}
+CLIENT_CONFIG = "/auth/config"          # authsvc's, under the application URL: the Config fields
+REQUIRED = ("auth_url", "api_url", "client_id", "resource")
 
 
 class AuthError(Exception):
@@ -55,7 +62,10 @@ class Config:
     cache_file: Path = Path.home() / ".config" / "agenticwf" / "credentials.json"
 
     @classmethod
-    def from_env(cls, **overrides: Any) -> "Config":
+    def from_env(cls, discovered: Optional[dict] = None, **overrides: Any) -> "Config":
+        """The AGENTICWF_* environment, then `overrides`. What is still missing comes from
+        `discovered`, or else is looked up (`sign_in_settings`) from AGENTICWF_API_URL,
+        AGENTICWF_AGENT_URL or AGENTICWF_KB_URL, the first one set."""
         env = os.environ.get
         values = {
             "auth_url": env("AGENTICWF_AUTH_URL"),
@@ -71,9 +81,15 @@ class Config:
         if env("AGENTICWF_CREDENTIALS"):
             values["cache_file"] = Path(env("AGENTICWF_CREDENTIALS"))
         values.update({k: v for k, v in overrides.items() if v is not None})
-        missing = [k for k in ("auth_url", "api_url", "client_id", "resource") if not values.get(k)]
+        where = None
+        if discovered is None and not all(values.get(k) for k in REQUIRED):
+            where = values["api_url"] or env("AGENTICWF_AGENT_URL") or env("AGENTICWF_KB_URL")
+            discovered = sign_in_settings(where) if where else {}
+        values.update({k: v for k, v in (discovered or {}).items() if v and not values.get(k)})
+        missing = [k for k in REQUIRED if not values.get(k)]
         if missing:
-            raise AuthError("missing configuration: " + ", ".join(f"AGENTICWF_{m.upper()}" for m in missing))
+            found = f" (not published by {_link_token(where)[0]})" if where else ""
+            raise AuthError("missing configuration: " + ", ".join(f"AGENTICWF_{m.upper()}" for m in missing) + found)
         values["auth_url"] = values["auth_url"].rstrip("/")
         values["api_url"] = values["api_url"].rstrip("/")
         return cls(**{k: v for k, v in values.items() if v is not None})
@@ -270,27 +286,93 @@ class Client:
         return body
 
 
+def _get_json(url: str) -> Optional[dict]:
+    """A public JSON document, or None (none there, not JSON, or the server cannot be reached)."""
+    try:
+        status, body = _http("GET", url)
+    except AuthError:
+        return None
+    return body if status == 200 and isinstance(body, dict) else None
+
+
+def _link_token(url: str) -> tuple[str, Optional[str]]:
+    """A service URL without a trailing slash, and the token of a sign-in link (…/?token=…, as
+    `agenticwf-agent serve` and `agenticwf-kb token --ensure` print it), if it is one."""
+    parts = urllib.parse.urlsplit(url)
+    query = urllib.parse.parse_qs(parts.query)
+    token = (query.pop("token", None) or [None])[0]
+    if token is not None:
+        url = urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query, doseq=True), fragment=""))
+    return url.rstrip("/"), token
+
+
+def describe(url: str) -> Optional[dict]:
+    """How the service at `url` signs clients in (its /.well-known/agenticwf): `auth` is "logto"
+    (behind Caddy and authsvc), "token" (its own token) or "none"; `base_path` is where it lives
+    under the application URL. None when it publishes nothing (an older server, or unreachable)."""
+    return _get_json(_link_token(url)[0] + WELL_KNOWN)
+
+
+def sign_in_settings(url: str, about: Optional[dict] = None) -> dict:
+    """The Logto settings (Config fields auth_url, api_url, client_id, resource) of the application
+    behind the service at `url` (or the application URL itself): authsvc's /auth/config at the
+    service URL without its base_path. `about` is the service's `describe`. Empty when not found."""
+    url = _link_token(url)[0]
+    about = describe(url) if about is None else about
+    if not about or about.get("auth") != "logto":
+        return {}
+    base = (about.get("base_path") or "").rstrip("/")
+    app = url[:-len(base)] if base and url.endswith(base) else url
+    found = {k: v.rstrip("/") for k, v in (_get_json(app + CLIENT_CONFIG) or {}).items()
+             if k in REQUIRED and isinstance(v, str) and v}
+    return {"api_url": app, **found} if found else {}
+
+
+def _is_loopback(url: str) -> bool:
+    host = urllib.parse.urlsplit(url).hostname or ""
+    return host == "localhost" or host.startswith("127.") or host == "::1"
+
+
 def service_access(service: str, path: str, url: Optional[str] = None, token: Optional[str] = None,
-                   **overrides: Any) -> tuple[str, Callable[[], str]]:
+                   token_file: Optional[Path] = None, **overrides: Any) -> tuple[str, Callable[[], str]]:
     """The base URL of a service and a function returning a valid Bearer token for it.
 
-    AGENTICWF_<SERVICE>_TOKEN (or _TOKEN_FILE) is the service's own token, sent as it is: the
-    personal agent's (`agenticwf-agent token`) or a standalone KB's (`agenticwf-kb token`).
-    Without one, tokens come from Logto as for `agenticwf token`. The URL is
-    AGENTICWF_<SERVICE>_URL, else AGENTICWF_API_URL + `path` (where Caddy serves the service).
-    `url`, `token` and `overrides` (Config fields) take precedence over the environment."""
+    AGENTICWF_<SERVICE>_TOKEN (or _TOKEN_FILE, or a sign-in link …/?token=… as the URL) is the
+    service's own token, sent as it is: the personal agent's (`agenticwf-agent token`) or a
+    standalone KB's (`agenticwf-kb token`). Without one, and unless the Logto settings are all set,
+    the service tells how it signs clients in (`describe`): with its own token (then `token_file`, when it exists and the service is on this
+    machine), or with Logto as for `agenticwf token`, whose settings the application publishes
+    (`sign_in_settings`), so AGENTICWF_<SERVICE>_URL alone is enough. Without that URL, it is
+    AGENTICWF_API_URL + `path` (where Caddy serves the service). `url`, `token` and `overrides`
+    (Config fields) take precedence over the environment."""
     env, prefix = os.environ.get, f"AGENTICWF_{service.upper()}_"
     url = url or env(prefix + "URL")
-    token = token or env(prefix + "TOKEN")
+    linked = None
+    if url:
+        url, linked = _link_token(url)
+    token = token or env(prefix + "TOKEN") or linked
     if not token and env(prefix + "TOKEN_FILE"):
         token = Path(env(prefix + "TOKEN_FILE")).expanduser().read_text().strip() or None
+    # Asked only when the Logto settings are not all set: then they are what the service uses.
+    configured = all(overrides.get(k) or env(f"AGENTICWF_{k.upper()}") for k in REQUIRED)
+    about = describe(url) if url and not token and not configured else None
+    if about and about.get("auth") == "token" and token_file and _is_loopback(url):
+        token_file = Path(token_file).expanduser()
+        token = (token_file.read_text().strip() or None) if token_file.is_file() else None
     if token:
         api_url = overrides.get("api_url") or env("AGENTICWF_API_URL")
         if not url and not api_url:
             raise AuthError(f"{prefix}TOKEN is set: set {prefix}URL (or AGENTICWF_API_URL) too")
         return (url or api_url.rstrip("/") + path).rstrip("/"), lambda: token
+    if about and about.get("auth") == "token":
+        how = f"; to get it: {about['token_help']}" if about.get("token_help") else ""
+        raise AuthError(f"{url} is a {service} with its own token ({about.get('mode')} mode): set {prefix}TOKEN "
+                        f"(or {prefix}TOKEN_FILE), or {prefix}URL to its sign-in link (…/?token=…){how}")
+    if about and about.get("auth") not in (None, "logto"):
+        raise AuthError(f"{url} takes no sign-ins ({about.get('mode')} mode: for other services only)")
     try:
-        client = Client.from_env(**overrides)
+        discovered = sign_in_settings(url, about) if about else None
+        client = Client(Config.from_env(discovered=discovered, **overrides))
     except AuthError as exc:
         raise AuthError(f"{exc} (or, for the service's own token, {prefix}URL and {prefix}TOKEN)") from None
     return (url or client.config.api_url + path).rstrip("/"), client.access_token

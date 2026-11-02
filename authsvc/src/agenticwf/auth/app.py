@@ -6,6 +6,8 @@ Endpoints:
               request with the X-Auth-* headers below; other responses go to the client.
     /whoami   Return the AuthContext of the presented token (debugging / clients).
     /healthz  Liveness.
+    /auth/config  Public: what the `agenticwf` CLI needs besides a credential (Logto URL, the
+              application URL, the CLI app id, the API resource), so a client finds them from a URL.
     /auth/*   Browser login (see ``agenticwf.auth.web``), when AUTH_WEB_CLIENT_ID is configured.
     /auth/tokens  Personal access tokens for the CLI (see ``agenticwf.auth.tokens``), when
               AUTH_MGMT_CLIENT_ID is configured as well.
@@ -107,7 +109,9 @@ def create_app(
         """A user's organizations (groups), for the backends; machines have none."""
         if memberships is None or ctx.is_machine or ctx.user_id is None:
             return ctx
-        return ctx.with_organizations(memberships.names(ctx.user_id))
+        found = memberships.of(ctx.user_id)
+        return ctx.with_organizations({org_id: m["name"] for org_id, m in found.items()},
+                                      managed=[org_id for org_id, m in found.items() if settings.group_admin_role in m["roles"]])
 
     def context_from_token(token: str, method: str) -> AuthContext:
         claims = verifier.verify(token)
@@ -176,10 +180,12 @@ def create_app(
                 if stale_cookie:
                     web.clear_session_cookie(response)
                 return response
-            if decision.code == APPROVAL_PENDING and settings.web_enabled and web.wants_html(method, request.headers):
+            if settings.web_enabled and web.wants_html(method, request.headers):
                 info = session.user_info if session else {}
                 user = info.get("email") or info.get("name") or info.get("username") or (ctx.subject if ctx else "")
-                return web.pending_page(settings.app_base_path, uri, user)
+                if decision.code == APPROVAL_PENDING:
+                    return web.pending_page(settings.app_base_path, uri, user)
+                return web.forbidden_page(settings.app_base_path, uri, user, decision.reason)
             return _error(403, decision.code or "insufficient_scope", decision.reason, settings.realm)
 
         telemetry.record_verify(allowed=True, credential=credential, public=is_public)
@@ -212,5 +218,11 @@ def create_app(
     @app.get("/healthz")
     def healthz() -> dict:
         return {"status": "ok"}
+
+    @app.get("/auth/config")
+    def client_config() -> dict:
+        # Not secret: the same values as the AGENTICWF_* settings shown with a new access token.
+        return {"auth_url": settings.logto_endpoint, "api_url": settings.app_url if settings.app_origin else None,
+                "client_id": settings.cli_client_id, "resource": settings.resource}
 
     return app

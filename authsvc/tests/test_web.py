@@ -262,3 +262,13 @@ def test_pending_page_escapes_user_and_keeps_base_path():
     assert "<script>alert(1)" not in page and "&lt;script&gt;" in page
     assert "/app/auth/recheck?return_to=%2Fapp%2Fchat%3Fx%3D1" in page
     assert 'action="/app/auth/logout"' in page
+
+
+def test_forbidden_page_escapes_and_keeps_base_path():
+    from agenticwf.auth.web import forbidden_page
+
+    page = forbidden_page("/app", "/jaeger/", "<b>bob</b>", "missing scopes: admin")
+    assert page.status_code == 403
+    text = page.body.decode()
+    assert "<b>bob" not in text and "&lt;b&gt;bob" in text and "missing scopes: admin" in text
+    assert 'href="/app/">Home' in text and "/app/auth/recheck?return_to=%2Fapp%2Fjaeger%2F" in text

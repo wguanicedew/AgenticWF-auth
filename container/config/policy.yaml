@@ -29,6 +29,10 @@ required_scopes: [app:access]
 rules:
   - path: /healthz
     public: true
+  # How clients sign in (`agenticwf agent` with only AGENTICWF_AGENT_URL)
+  - path: /.well-known/agenticwf
+    methods: [GET]
+    public: true
 
   # --- Browser pages (unauthenticated page loads are redirected to /auth/login) ---
   - path: /

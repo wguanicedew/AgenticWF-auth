@@ -49,12 +49,16 @@ class AuthContext:
     # Every Logto organization the user belongs to, id -> name (groups, agenticwf.auth.groups).
     # Not in the token: authsvc looks the memberships up, so they apply within a minute.
     organizations: dict[str, str] = field(default_factory=dict)
+    # The ones of them the user administers (AUTH_GROUP_ADMIN_ROLE): a backend may let them approve
+    # what concerns the group, e.g. the KB's requests to share with it.
+    managed_organizations: frozenset[str] = frozenset()
 
     def with_method(self, auth_method: str) -> "AuthContext":
         return replace(self, auth_method=auth_method)
 
-    def with_organizations(self, organizations: dict[str, str]) -> "AuthContext":
-        return replace(self, organizations=dict(organizations))
+    def with_organizations(self, organizations: dict[str, str], managed=()) -> "AuthContext":
+        return replace(self, organizations=dict(organizations),
+                       managed_organizations=frozenset(m for m in managed if m in organizations))
 
     @property
     def is_machine(self) -> bool:
@@ -124,6 +128,7 @@ class AuthContext:
             "auth_method": self.auth_method,
             # getattr: a context pickled before this field existed (e.g. a queued agent task) has none
             "organizations": dict(sorted(getattr(self, "organizations", {}).items())),
+            "managed_organizations": sorted(getattr(self, "managed_organizations", ())),
         }
 
     @classmethod
@@ -141,6 +146,7 @@ class AuthContext:
             expires_at=data.get("expires_at"),
             auth_method=data.get("auth_method", "bearer"),
             organizations={str(k): str(v) for k, v in (data.get("organizations") or {}).items()},
+            managed_organizations=frozenset(str(m) for m in data.get("managed_organizations") or ()),
         )
 
 

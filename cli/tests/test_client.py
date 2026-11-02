@@ -33,6 +33,16 @@ class FakeServer(BaseHTTPRequestHandler):
             return self._send(200, {"token_endpoint": f"{base}/oidc/token",
                                     "device_authorization_endpoint": f"{base}/oidc/device/auth",
                                     "revocation_endpoint": f"{base}/oidc/token/revocation"})
+        # Discovery: the agent at /app, a KB at /app/kb, authsvc's /app/auth/config, a standalone KB.
+        if self.path in ("/app/.well-known/agenticwf", "/app/kb/.well-known/agenticwf"):
+            return self._send(200, {"service": "kb" if "/kb/" in self.path else "agent", "mode": "authsvc",
+                                    "auth": "logto", "base_path": "/kb" if "/kb/" in self.path else ""})
+        if self.path == "/app/auth/config":
+            return self._send(200, {"auth_url": base, "api_url": base + "/app", "client_id": "cli",
+                                    "resource": "https://api.example.org"})
+        if self.path == "/solo/kb/.well-known/agenticwf":
+            return self._send(200, {"service": "kb", "mode": "standalone", "auth": "token", "base_path": "/kb",
+                                    "token_help": "agenticwf-kb token"})
         if self.path == "/api/v1/pending":
             return self._send(403, {"error": "approval_pending", "error_description": "account is awaiting approval"})
         if self.path == "/api/v1/me":
@@ -207,6 +217,55 @@ def test_service_access_with_its_own_token(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENTICWF_AGENT_URL", "http://127.0.0.1:8765/")
     base, token = service_access("agent", "")
     assert base == "http://127.0.0.1:8765" and token() == "local-token"   # no Logto configuration needed
+
+
+@pytest.fixture
+def bare_env(tmp_path, monkeypatch):
+    """No AGENTICWF_* settings but the credentials cache."""
+    for k in ("AUTH_URL", "API_URL", "CLIENT_ID", "RESOURCE", "CLIENT_SECRET", "TOKEN", "TOKEN_FILE", "KB_URL",
+              "KB_TOKEN", "KB_TOKEN_FILE", "AGENT_URL", "AGENT_TOKEN", "AGENT_TOKEN_FILE"):
+        monkeypatch.delenv(f"AGENTICWF_{k}", raising=False)
+    monkeypatch.setenv("AGENTICWF_CREDENTIALS", str(tmp_path / "credentials.json"))
+    return monkeypatch
+
+
+def test_service_url_alone_finds_logto(server, bare_env):
+    bare_env.setenv("AGENTICWF_KB_URL", server + "/app/kb/")
+    config = Config.from_env()      # as `agenticwf login` reads it
+    assert (config.auth_url, config.api_url, config.client_id) == (server, server + "/app", "cli")
+    assert config.resource == "https://api.example.org"
+    bare_env.setenv("AGENTICWF_TOKEN", "pat_good")
+    base, token = service_access("kb", "/kb")
+    assert base == server + "/app/kb" and token() == "from-pat"
+    bare_env.setenv("AGENTICWF_AGENT_URL", server + "/app")
+    assert service_access("agent", "")[0] == server + "/app"
+    bare_env.setenv("AGENTICWF_CLIENT_ID", "other")     # what is set wins
+    assert Config.from_env().client_id == "other"
+
+
+def test_application_url_alone_finds_logto(server, bare_env):
+    bare_env.setenv("AGENTICWF_API_URL", server + "/app")
+    assert Config.from_env().client_id == "cli"
+
+
+def test_nothing_published(server, bare_env):
+    bare_env.setenv("AGENTICWF_KB_URL", server + "/old/kb")
+    with pytest.raises(AuthError, match="AGENTICWF_AUTH_URL.*not published by"):
+        Config.from_env()
+    with pytest.raises(AuthError, match="AGENTICWF_KB_TOKEN"):
+        service_access("kb", "/kb")
+
+
+def test_service_with_its_own_token_from_the_url(server, tmp_path, bare_env):
+    bare_env.setenv("AGENTICWF_KB_URL", server + "/solo/kb")
+    with pytest.raises(AuthError, match="own token.*sign-in link.*agenticwf-kb token"):
+        service_access("kb", "/kb")
+    bare_env.setenv("AGENTICWF_KB_URL", server + "/solo/kb/?token=kb-token")    # the printed sign-in link
+    base, token = service_access("kb", "/kb")
+    assert base == server + "/solo/kb" and token() == "kb-token"
+    bare_env.setenv("AGENTICWF_KB_URL", server + "/solo/kb")
+    (tmp_path / "token").write_text("from-file\n")       # the personal agent's home, on this machine
+    assert service_access("kb", "/kb", token_file=tmp_path / "token")[1]() == "from-file"
 
 
 class _Plugin:
