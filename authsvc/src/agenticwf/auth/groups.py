@@ -110,7 +110,10 @@ class Profiles(_PerUser):
 
     def fetch(self, user_id: str) -> dict[str, str]:
         user = self.management.user(user_id)
-        found = {"username": user.get("username"), "name": user.get("name"), "email": user.get("primaryEmail")}
+        # Accounts made while sign-up asked only for an email have no username: their email stands
+        # in, so `username` always names the user (e.g. knowledge bases `username:kb-name`).
+        found = {"username": user.get("username") or user.get("primaryEmail"), "name": user.get("name"),
+                 "email": user.get("primaryEmail")}
         return {k: v for k, v in found.items() if isinstance(v, str) and v}
 
 

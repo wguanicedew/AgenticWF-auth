@@ -218,9 +218,12 @@ class Client:
             raise AuthError(f"device authorization failed: {device}")
 
         url = device.get("verification_uri_complete") or device["verification_uri"]
-        self.out(f"To sign in, paste this link into a web browser (on any machine):\n\n    {url}\n\n"
-                 f"sign in, check that the code is {device['user_code']} and approve.\n"
-                 "Waiting for the approval (Ctrl-C to cancel)...")
+        self.out("To sign in:\n\n"
+                 "  1. Open this link in a web browser (on this or any other machine):\n\n"
+                 f"       {url}\n\n"
+                 f"  2. Sign in and confirm that the page shows the code:  {device['user_code']}\n"
+                 "  3. Approve the request.\n\n"
+                 "Waiting for your approval (Ctrl-C to cancel)...")
 
         interval = int(device.get("interval", 5))
         deadline = time.time() + int(device.get("expires_in", 600))

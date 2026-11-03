@@ -205,6 +205,16 @@ def test_profiles_keep_only_what_is_set():
     assert Profiles(orgs).of("alice") == {}            # unknown while Logto is down: nothing shown
 
 
+def test_profiles_username_falls_back_to_email():
+    class NoUsername(FakeOrgs):
+        def user(self, user_id):
+            return {"id": user_id, "primaryEmail": f"{user_id}@example.org"}
+    assert Profiles(NoUsername()).of("erin") == {"username": "erin@example.org", "email": "erin@example.org"}
+    orgs = FakeOrgs()
+    orgs.down = True
+    assert Profiles(orgs).of("alice") == {}            # unknown while Logto is down: nothing shown
+
+
 def test_memberships_cache_and_failure():
     orgs, now = FakeOrgs(), [1000.0]
     gid = orgs.create_organization("EIC", "")["id"]
