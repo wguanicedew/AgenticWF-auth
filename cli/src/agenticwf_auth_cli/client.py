@@ -12,7 +12,8 @@ tokens above, or directly with the service's own token (a personal agent, a stan
 
 Only a URL is needed: a service publishes how it signs clients in at <its URL>/.well-known/agenticwf,
 and behind Caddy authsvc publishes the Logto settings (AGENTICWF_AUTH_URL, _API_URL, _CLIENT_ID,
-_RESOURCE) at <application URL>/auth/config. Variables that are set take precedence.
+_RESOURCE, and the scopes to ask for: _SCOPES) at <application URL>/auth/config. Variables that are
+set take precedence.
 """
 
 from __future__ import annotations
@@ -25,10 +26,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+from agenticwf_auth_cli.tls import ssl_context
 
 DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
 TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange"
@@ -37,6 +39,7 @@ EXPIRY_MARGIN = 60
 WELL_KNOWN = "/.well-known/agenticwf"   # a service's: {service, mode, auth, base_path, token_help}
 CLIENT_CONFIG = "/auth/config"          # authsvc's, under the application URL: the Config fields
 REQUIRED = ("auth_url", "api_url", "client_id", "resource")
+DEFAULT_SCOPES = "openid offline_access"
 
 
 class AuthError(Exception):
@@ -56,7 +59,7 @@ class Config:
     api_url: str  # application, e.g. https://app.example.org
     client_id: str  # Logto Native app (device flow) or M2M app
     resource: str  # Logto API resource indicator
-    scopes: str = "openid offline_access"
+    scopes: Optional[str] = None  # None: what the application publishes (Client.scopes)
     client_secret: Optional[str] = None  # set -> client credentials
     personal_token: Optional[str] = None  # set -> exchange this PAT for access tokens
     cache_file: Path = Path.home() / ".config" / "agenticwf" / "credentials.json"
@@ -72,7 +75,7 @@ class Config:
             "api_url": env("AGENTICWF_API_URL"),
             "client_id": env("AGENTICWF_CLIENT_ID"),
             "resource": env("AGENTICWF_RESOURCE"),
-            "scopes": env("AGENTICWF_SCOPES", "openid offline_access"),
+            "scopes": env("AGENTICWF_SCOPES"),
             "client_secret": env("AGENTICWF_CLIENT_SECRET"),
             "personal_token": env("AGENTICWF_TOKEN"),
         }
@@ -116,7 +119,7 @@ def _http(method: str, url: str, form: Optional[dict] = None, body: Any = None,
         headers["Authorization"] = "Basic " + base64.b64encode(pair.encode()).decode()
     request = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=30, context=ssl_context()) as response:
             status, raw = response.status, response.read()
     except urllib.error.HTTPError as exc:
         status, raw = exc.code, exc.read()
@@ -189,9 +192,19 @@ class Client:
         body["expires_at"] = int(time.time()) + int(body.get("expires_in", 3600))
         return body
 
+    def scopes(self) -> str:
+        """AGENTICWF_SCOPES, else the application's (authsvc /auth/config: the browser sign-in's), else
+        openid offline_access. Logto puts in a token only the API permissions asked for (and granted)."""
+        if not self.config.scopes:
+            published = (_get_json(self.config.api_url + CLIENT_CONFIG) or {}).get("scopes")
+            self.config.scopes = published if isinstance(published, str) and published.strip() else DEFAULT_SCOPES
+        return self.config.scopes
+
     # --- login flows -----------------------------------------------------------------
-    def login(self, open_browser: bool = True) -> dict:
-        """Interactive user login with the OAuth 2.0 device authorization grant."""
+    def login(self) -> dict:
+        """Interactive user login with the OAuth 2.0 device authorization grant. No browser is
+        started (on a remote or headless machine it would be a text browser, or fail): the user
+        opens the link in a browser of their own, signs in and approves, while this waits."""
         if self.config.client_secret:
             raise AuthError("AGENTICWF_CLIENT_SECRET is set: machine clients do not log in")
         if self.config.personal_token:
@@ -200,17 +213,14 @@ class Client:
         if not endpoint:
             raise AuthError("Logto does not advertise a device_authorization_endpoint")
         status, device = _http("POST", endpoint, form={
-            "client_id": self.config.client_id, "scope": self.config.scopes, "resource": self.config.resource})
+            "client_id": self.config.client_id, "scope": self.scopes(), "resource": self.config.resource})
         if status != 200 or not isinstance(device, dict):
             raise AuthError(f"device authorization failed: {device}")
 
         url = device.get("verification_uri_complete") or device["verification_uri"]
-        self.out(f"To sign in, open:\n\n    {url}\n\nand confirm the code: {device['user_code']}\n")
-        if open_browser:
-            try:
-                webbrowser.open(url)
-            except Exception:  # noqa: BLE001 - headless machines
-                pass
+        self.out(f"To sign in, paste this link into a web browser (on any machine):\n\n    {url}\n\n"
+                 f"sign in, check that the code is {device['user_code']} and approve.\n"
+                 "Waiting for the approval (Ctrl-C to cancel)...")
 
         interval = int(device.get("interval", 5))
         deadline = time.time() + int(device.get("expires_in", 600))
@@ -242,7 +252,9 @@ class Client:
     def access_token(self) -> str:
         """A valid access token, refreshing or re-acquiring as needed."""
         now = time.time()
-        api_scopes = " ".join(s for s in self.config.scopes.split() if s not in ("openid", "offline_access"))
+        # A machine client asks for what AGENTICWF_SCOPES says; a person's token for what they sign in with.
+        scopes = (self.config.scopes or DEFAULT_SCOPES) if self.config.client_secret else self.scopes()
+        api_scopes = " ".join(s for s in scopes.split() if s not in ("openid", "offline_access"))
         if self.config.client_secret or self.config.personal_token:
             if not self._issued or self._issued["expires_at"] - now < EXPIRY_MARGIN:
                 if self.config.client_secret:
@@ -324,7 +336,7 @@ def sign_in_settings(url: str, about: Optional[dict] = None) -> dict:
     base = (about.get("base_path") or "").rstrip("/")
     app = url[:-len(base)] if base and url.endswith(base) else url
     found = {k: v.rstrip("/") for k, v in (_get_json(app + CLIENT_CONFIG) or {}).items()
-             if k in REQUIRED and isinstance(v, str) and v}
+             if k in (*REQUIRED, "scopes") and isinstance(v, str) and v}
     return {"api_url": app, **found} if found else {}
 
 

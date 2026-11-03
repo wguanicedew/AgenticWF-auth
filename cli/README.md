@@ -5,7 +5,7 @@ The `agenticwf` command for [AgenticWF](https://github.com/InnovateAILab/Agentic
 
 ```bash
 pip install agenticwf-auth-client
-agenticwf login                 # opens the browser; works over SSH too
+agenticwf login                 # prints a link to paste into a browser; works over SSH too
 agenticwf token                 # a valid access token, e.g. for curl
 agenticwf whoami
 agenticwf call GET /api/v1/me
@@ -31,6 +31,11 @@ export AGENTICWF_RESOURCE=<API resource indicator>
 
 Scripts and CI use a personal access token instead (`AGENTICWF_TOKEN=pat_…`), or a machine
 client (`AGENTICWF_CLIENT_ID` + `AGENTICWF_CLIENT_SECRET`).
+
+HTTPS: the clients trust the system's CAs plus CERN's, which are installed with the package
+(`agenticwf_auth_cli/cacerts/`), so a server with a CERN certificate works from a machine that
+lacks CERN's CA. A site CA of your own is added with `AGENTICWF_CA_BUNDLE=/path/to/ca.pem` (a
+file, or a `c_rehash`ed directory). These come on top of the system's, never instead of them.
 
 The service clients add their commands to `agenticwf`, with the same sign-in:
 

@@ -18,3 +18,6 @@ agenticwf = "agenticwf_auth_cli.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+agenticwf_auth_cli = ["cacerts/*.pem"]   # CERN's CAs (tls.py)

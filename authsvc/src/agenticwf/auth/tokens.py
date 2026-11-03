@@ -170,6 +170,10 @@ class ManagementClient:
     def organization_role_ids(self) -> dict[str, str]:
         return {r["name"]: r["id"] for r in self._all("/api/organization-roles", "listing group roles")}
 
+    def user(self, user_id: str) -> dict:
+        """The user's Logto record (username, name, primaryEmail, ...)."""
+        return self._expect(self._call("GET", f"/api/users/{quote(user_id, safe='')}"), "reading the user") or {}
+
     def find_user(self, email: str) -> dict | None:
         r = self._call("GET", f"/api/users?search.primaryEmail={quote(email, safe='')}&mode.primaryEmail=exact")
         users = self._expect(r, "looking up the user") or []

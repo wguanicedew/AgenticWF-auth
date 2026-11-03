@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 from agenticwf.auth.app import create_app
 from agenticwf.auth.context import HEADER_CONTEXT, HEADER_SIGNATURE, decode_context
-from agenticwf.auth.groups import Memberships, MemoryRequestStore
+from agenticwf.auth.groups import Memberships, MemoryRequestStore, Profiles
 from agenticwf.auth.oidc import TokenSet
 from agenticwf.auth.sessions import MemorySessionStore, SessionManager
 from agenticwf.auth.tokens import ManagementError, ManagementUnavailableError
@@ -74,6 +74,11 @@ class FakeOrgs:
 
     def organization_role_ids(self):
         return dict(ROLES)
+
+    def user(self, user_id):
+        if self.down:
+            raise ManagementUnavailableError("down")
+        return {"id": user_id, "username": user_id, "name": user_id.title(), "primaryEmail": self.users.get(user_id)}
 
     def find_user(self, email):
         return next(({"id": u, "primaryEmail": e} for u, e in self.users.items() if e == email), None)
@@ -182,11 +187,22 @@ def test_verify_carries_memberships(env, make_token):
     bob_ctx = decode_context(*(client("bob").get("/verify", headers=bob_headers).headers[h]
                                for h in (HEADER_CONTEXT, HEADER_SIGNATURE)), SECRET)
     assert bob_ctx.managed_organizations == {gid}      # bob administers the group: backends may let him approve for it
-    assert alice.get("/whoami", headers={"Authorization": headers["Authorization"]}).json()["organizations"] == {gid: "EIC"}
+    me = alice.get("/whoami", headers={"Authorization": headers["Authorization"]}).json()
+    assert me["organizations"] == {gid: "EIC"}
+    assert (me["username"], me["name"], me["email"]) == ("alice", "Alice", "alice@example.org")
+    assert (ctx.username, ctx.email) == ("alice", "alice@example.org")      # the backends see who it is
 
     orgs.down = True              # Logto unreachable: the last known groups stay, requests still pass
     memberships.forget("alice")
     assert alice.get("/verify", headers=headers).status_code == 200
+
+
+def test_profiles_keep_only_what_is_set():
+    orgs = FakeOrgs()
+    orgs.users["dave"] = None
+    assert Profiles(orgs).of("dave") == {"username": "dave", "name": "Dave"}
+    orgs.down = True
+    assert Profiles(orgs).of("alice") == {}            # unknown while Logto is down: nothing shown
 
 
 def test_memberships_cache_and_failure():

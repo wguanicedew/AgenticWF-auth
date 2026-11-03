@@ -7,15 +7,16 @@ Endpoints:
     /whoami   Return the AuthContext of the presented token (debugging / clients).
     /healthz  Liveness.
     /auth/config  Public: what the `agenticwf` CLI needs besides a credential (Logto URL, the
-              application URL, the CLI app id, the API resource), so a client finds them from a URL.
+              application URL, the CLI app id, the API resource, the scopes to ask for), so a
+              client finds them from a URL.
     /auth/*   Browser login (see ``agenticwf.auth.web``), when AUTH_WEB_CLIENT_ID is configured.
     /auth/tokens  Personal access tokens for the CLI (see ``agenticwf.auth.tokens``), when
               AUTH_MGMT_CLIENT_ID is configured as well.
     /auth/groups  Groups: Logto organizations, their members and join requests (see
               ``agenticwf.auth.groups``), with browser login and AUTH_MGMT_CLIENT_ID.
 
-With AUTH_MGMT_CLIENT_ID, the AuthContext of a user also carries their organizations (groups),
-looked up through the Management API and cached briefly.
+With AUTH_MGMT_CLIENT_ID, the AuthContext of a user also carries their username, name and email,
+and their organizations (groups), looked up through the Management API and cached briefly.
 
 Two kinds of credentials are accepted by /verify:
     Authorization: Bearer <Logto access token>   CLI tools, scripts, M2M clients
@@ -75,6 +76,7 @@ def create_app(
     logto: LogtoClient | None = None,
     management: tokens.ManagementClient | None = None,
     memberships: groups.Memberships | None = None,
+    profiles: groups.Profiles | None = None,
     group_requests: groups.RequestStore | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
@@ -99,6 +101,8 @@ def create_app(
         app.include_router(tokens.build_router(settings, sessions, verifier, management, policy.required_scopes))
     if memberships is None and settings.groups_enabled and management is not None:
         memberships = groups.Memberships(management, settings.group_cache_ttl)
+    if profiles is None and management is not None:
+        profiles = groups.Profiles(management, settings.group_cache_ttl)
     if memberships is not None and settings.web_enabled:
         assert sessions is not None and management is not None
         group_requests = group_requests or groups.build_request_store(settings.session_store, settings.session_db_url)
@@ -106,8 +110,13 @@ def create_app(
                                                policy.required_scopes))
 
     def with_groups(ctx: AuthContext) -> AuthContext:
-        """A user's organizations (groups), for the backends; machines have none."""
-        if memberships is None or ctx.is_machine or ctx.user_id is None:
+        """A user's profile (username, name, email) and organizations (groups), for the backends;
+        machines have none."""
+        if ctx.is_machine or ctx.user_id is None:
+            return ctx
+        if profiles is not None:
+            ctx = ctx.with_profile(profiles.of(ctx.user_id))
+        if memberships is None:
             return ctx
         found = memberships.of(ctx.user_id)
         return ctx.with_organizations({org_id: m["name"] for org_id, m in found.items()},
@@ -222,7 +231,9 @@ def create_app(
     @app.get("/auth/config")
     def client_config() -> dict:
         # Not secret: the same values as the AGENTICWF_* settings shown with a new access token.
+        # `scopes` are the browser sign-in's (AUTH_WEB_SCOPES): Logto puts in a token only the API
+        # permissions asked for, so a CLI asking for none would be signed in but not approved.
         return {"auth_url": settings.logto_endpoint, "api_url": settings.app_url if settings.app_origin else None,
-                "client_id": settings.cli_client_id, "resource": settings.resource}
+                "client_id": settings.cli_client_id, "resource": settings.resource, "scopes": settings.web_scopes}
 
     return app

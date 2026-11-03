@@ -52,6 +52,10 @@ class AuthContext:
     # The ones of them the user administers (AUTH_GROUP_ADMIN_ROLE): a backend may let them approve
     # what concerns the group, e.g. the KB's requests to share with it.
     managed_organizations: frozenset[str] = frozenset()
+    # Who the user is, for display: not in the token either; authsvc looks it up (Profiles).
+    username: str | None = None
+    name: str | None = None
+    email: str | None = None
 
     def with_method(self, auth_method: str) -> "AuthContext":
         return replace(self, auth_method=auth_method)
@@ -59,6 +63,9 @@ class AuthContext:
     def with_organizations(self, organizations: dict[str, str], managed=()) -> "AuthContext":
         return replace(self, organizations=dict(organizations),
                        managed_organizations=frozenset(m for m in managed if m in organizations))
+
+    def with_profile(self, profile: dict[str, str]) -> "AuthContext":
+        return replace(self, username=profile.get("username"), name=profile.get("name"), email=profile.get("email"))
 
     @property
     def is_machine(self) -> bool:
@@ -129,6 +136,9 @@ class AuthContext:
             # getattr: a context pickled before this field existed (e.g. a queued agent task) has none
             "organizations": dict(sorted(getattr(self, "organizations", {}).items())),
             "managed_organizations": sorted(getattr(self, "managed_organizations", ())),
+            "username": getattr(self, "username", None),
+            "name": getattr(self, "name", None),
+            "email": getattr(self, "email", None),
         }
 
     @classmethod
@@ -147,6 +157,9 @@ class AuthContext:
             auth_method=data.get("auth_method", "bearer"),
             organizations={str(k): str(v) for k, v in (data.get("organizations") or {}).items()},
             managed_organizations=frozenset(str(m) for m in data.get("managed_organizations") or ()),
+            username=data.get("username"),
+            name=data.get("name"),
+            email=data.get("email"),
         )
 
 

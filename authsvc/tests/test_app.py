@@ -49,7 +49,7 @@ def test_client_config_is_public(settings, verifier):
     r = client(s, verifier).get("/auth/config")
     assert r.status_code == 200
     assert r.json() == {"auth_url": "https://host", "api_url": "https://host/app", "client_id": "cli_1",
-                        "resource": settings.resource}
+                        "resource": settings.resource, "scopes": settings.web_scopes}
 
 
 def test_whoami(settings, verifier, make_token):
@@ -79,3 +79,18 @@ def test_end_to_end_propagation(settings, verifier, make_token):
     forged = {**copied, "X-Auth-Context-Sig": "AAAA"}
     assert backend.get("/api/v1/datasets/abc", headers=forged).status_code == 401
     assert backend.get("/api/v1/datasets/abc").status_code == 401
+
+
+def test_unfilled_caddy_placeholders_are_absent():
+    # Caddy < 2.7 copies a header authsvc did not send (public route, anonymous) as its placeholder.
+    app = FastAPI()
+    app.add_middleware(AuthContextMiddleware, secret=SECRET)
+
+    @app.get("/health")
+    def health():
+        return {"anonymous": current_auth_context() is None}
+
+    unfilled = {h: "{http.reverse_proxy.header.%s}" % h for h in ("X-Auth-Context", "X-Auth-Context-Sig")}
+    r = TestClient(app).get("/health", headers=unfilled)
+    assert r.status_code == 200 and r.json() == {"anonymous": True}
+    assert TestClient(app).get("/health", headers={**unfilled, "X-Auth-Context-Sig": "AAAA"}).status_code == 401

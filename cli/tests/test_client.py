@@ -39,7 +39,8 @@ class FakeServer(BaseHTTPRequestHandler):
                                     "auth": "logto", "base_path": "/kb" if "/kb/" in self.path else ""})
         if self.path == "/app/auth/config":
             return self._send(200, {"auth_url": base, "api_url": base + "/app", "client_id": "cli",
-                                    "resource": "https://api.example.org"})
+                                    "resource": "https://api.example.org",
+                                    "scopes": "openid offline_access app:access knowledge:read"})
         if self.path == "/solo/kb/.well-known/agenticwf":
             return self._send(200, {"service": "kb", "mode": "standalone", "auth": "token", "base_path": "/kb",
                                     "token_help": "agenticwf-kb token"})
@@ -105,7 +106,7 @@ def config(server, tmp_path):
 
 def test_device_login_cache_and_refresh(config):
     client = Client(config, out=lambda m: None)
-    client.login(open_browser=False)
+    client.login()
     assert FakeServer.state["polls"] == 2
     assert (config.cache_file.stat().st_mode & 0o777) == 0o600
     device_req = next(f for p, f in FakeServer.state["requests"] if p == "/oidc/device/auth")
@@ -124,7 +125,7 @@ def test_not_logged_in_and_logout(config):
     client = Client(config, out=lambda m: None)
     with pytest.raises(AuthError):
         client.access_token()
-    client.login(open_browser=False)
+    client.login()
     client.logout()
     assert any(p == "/oidc/token/revocation" for p, _ in FakeServer.state["requests"])
     with pytest.raises(AuthError):
@@ -222,8 +223,8 @@ def test_service_access_with_its_own_token(tmp_path, monkeypatch):
 @pytest.fixture
 def bare_env(tmp_path, monkeypatch):
     """No AGENTICWF_* settings but the credentials cache."""
-    for k in ("AUTH_URL", "API_URL", "CLIENT_ID", "RESOURCE", "CLIENT_SECRET", "TOKEN", "TOKEN_FILE", "KB_URL",
-              "KB_TOKEN", "KB_TOKEN_FILE", "AGENT_URL", "AGENT_TOKEN", "AGENT_TOKEN_FILE"):
+    for k in ("AUTH_URL", "API_URL", "CLIENT_ID", "RESOURCE", "SCOPES", "CLIENT_SECRET", "TOKEN", "TOKEN_FILE",
+              "KB_URL", "KB_TOKEN", "KB_TOKEN_FILE", "AGENT_URL", "AGENT_TOKEN", "AGENT_TOKEN_FILE"):
         monkeypatch.delenv(f"AGENTICWF_{k}", raising=False)
     monkeypatch.setenv("AGENTICWF_CREDENTIALS", str(tmp_path / "credentials.json"))
     return monkeypatch
@@ -246,6 +247,22 @@ def test_service_url_alone_finds_logto(server, bare_env):
 def test_application_url_alone_finds_logto(server, bare_env):
     bare_env.setenv("AGENTICWF_API_URL", server + "/app")
     assert Config.from_env().client_id == "cli"
+
+
+def test_login_asks_for_the_published_scopes(server, bare_env):
+    # All set but the scopes: they still come from the application, as the browser sign-in's
+    for k, v in (("AUTH_URL", server), ("API_URL", server + "/app"), ("CLIENT_ID", "cli"),
+                 ("RESOURCE", "https://api.example.org")):
+        bare_env.setenv(f"AGENTICWF_{k}", v)
+    Client(Config.from_env(), out=lambda m: None).login()
+    device_req = [f for p, f in FakeServer.state["requests"] if p == "/oidc/device/auth"][-1]
+    assert device_req["scope"] == "openid offline_access app:access knowledge:read"
+    bare_env.setenv("AGENTICWF_SCOPES", "openid knowledge:read")      # what is set wins
+    assert Client(Config.from_env()).scopes() == "openid knowledge:read"
+
+
+def test_scopes_default_when_none_published(config):
+    assert Client(config).scopes() == "openid offline_access"
 
 
 def test_nothing_published(server, bare_env):

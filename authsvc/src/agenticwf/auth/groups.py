@@ -48,30 +48,34 @@ RETRY_AFTER_FAILURE = 10
 
 # --- memberships ---------------------------------------------------------------------------------
 
-class Memberships:
-    """Each user's organizations ({org id: {"name", "roles"}}), cached for `ttl` seconds. When the
-    Management API fails, the last known answer stays (or none), retried after a few seconds."""
+class _PerUser:
+    """Something about each user, from the Management API (`fetch`), cached for `ttl` seconds. When
+    the Management API fails, the last known answer stays (or none), retried after a few seconds."""
+
+    what = "details"
 
     def __init__(self, management: ManagementClient, ttl: int = 60, clock: Callable[[], float] = time.time):
         self.management = management
         self.ttl = ttl
         self.clock = clock
-        self._cache: dict[str, tuple[float, dict[str, dict]]] = {}
+        self._cache: dict[str, tuple[float, dict]] = {}
         self._lock = threading.Lock()
 
-    def of(self, user_id: str, fresh: bool = False) -> dict[str, dict]:
+    def fetch(self, user_id: str) -> dict:
+        raise NotImplementedError
+
+    def of(self, user_id: str, fresh: bool = False) -> dict:
         now = self.clock()
         with self._lock:
             cached = self._cache.get(user_id)
         if cached and not fresh and cached[0] > now:
             return cached[1]
         try:
-            found = {o["id"]: {"name": o.get("name") or o["id"], "roles": {r["name"] for r in o.get("organizationRoles") or ()}}
-                     for o in self.management.user_organizations(user_id)}
+            found = self.fetch(user_id)
         except (ManagementError, ManagementUnavailableError) as exc:
             if fresh:
                 raise
-            log.warning("groups of %s unknown (%s); using the last known", user_id, exc)
+            log.warning("%s of %s unknown (%s); using the last known", self.what, user_id, exc)
             found = cached[1] if cached else {}
             with self._lock:
                 self._cache[user_id] = (now + RETRY_AFTER_FAILURE, found)
@@ -80,13 +84,34 @@ class Memberships:
             self._cache[user_id] = (now + self.ttl, found)
         return found
 
-    def names(self, user_id: str) -> dict[str, str]:
-        return {org_id: m["name"] for org_id, m in self.of(user_id).items()}
-
     def forget(self, *user_ids: str) -> None:
         with self._lock:
             for user_id in user_ids:
                 self._cache.pop(user_id, None)
+
+
+class Memberships(_PerUser):
+    """Each user's organizations ({org id: {"name", "roles"}})."""
+
+    what = "groups"
+
+    def fetch(self, user_id: str) -> dict[str, dict]:
+        return {o["id"]: {"name": o.get("name") or o["id"], "roles": {r["name"] for r in o.get("organizationRoles") or ()}}
+                for o in self.management.user_organizations(user_id)}
+
+    def names(self, user_id: str) -> dict[str, str]:
+        return {org_id: m["name"] for org_id, m in self.of(user_id).items()}
+
+
+class Profiles(_PerUser):
+    """Each user's username, name and email (those set), for display: the access token has none."""
+
+    what = "profile"
+
+    def fetch(self, user_id: str) -> dict[str, str]:
+        user = self.management.user(user_id)
+        found = {"username": user.get("username"), "name": user.get("name"), "email": user.get("primaryEmail")}
+        return {k: v for k, v in found.items() if isinstance(v, str) and v}
 
 
 # --- join requests -------------------------------------------------------------------------------

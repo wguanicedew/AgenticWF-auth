@@ -26,6 +26,9 @@ class FakeManagement:
         self.tokens[(user_id, name)] = token
         return token
 
+    def user(self, user_id):
+        return {"id": user_id, "username": user_id}
+
     def delete(self, user_id, name):
         if self.tokens.pop((user_id, name), None) is None:
             raise ManagementError(404, "No such token.")

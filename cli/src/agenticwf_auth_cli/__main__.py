@@ -1,6 +1,6 @@
 """agenticwf — command-line access to the AgenticWF API.
 
-    agenticwf login                     sign in via the browser (device flow)
+    agenticwf login                     sign in: paste the printed link into a browser (device flow)
     agenticwf token                     print a valid access token (for curl)
     agenticwf whoami                    show the identity the API sees
     agenticwf call GET /api/v1/me       call the API
@@ -51,7 +51,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--scopes", help="space separated scopes (AGENTICWF_SCOPES)")
     sub = parser.add_subparsers(dest="command", required=True)
     login = sub.add_parser("login")
-    login.add_argument("--no-browser", action="store_true")
+    login.add_argument("--no-browser", action="store_true", help=argparse.SUPPRESS)   # the default now; kept for scripts
     sub.add_parser("logout")
     sub.add_parser("token")
     sub.add_parser("whoami")
@@ -73,7 +73,7 @@ def main(argv: list[str] | None = None) -> int:
             return args.run(args)
         client = Client.from_env(**args.auth)
         if args.command == "login":
-            client.login(open_browser=not args.no_browser)
+            client.login()
         elif args.command == "logout":
             client.logout()
         elif args.command == "token":

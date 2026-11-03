@@ -43,7 +43,9 @@ class AuthContextMiddleware:
     """ASGI middleware: verify the propagated AuthContext and expose it via ContextVar.
 
     Requests without context headers proceed anonymously (public routes); requests with
-    invalid or replayed context headers are rejected with 401.
+    invalid or replayed context headers are rejected with 401. A header that is still a Caddy
+    placeholder counts as absent: Caddy before 2.7 copies a header authsvc did not send (a public
+    route, no credential) as the unfilled `{http.reverse_proxy.header.…}`.
     """
 
     def __init__(self, app: Any, secret: bytes, bind_request: bool = True):
@@ -57,8 +59,8 @@ class AuthContextMiddleware:
             return
 
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}
-        payload = headers.get(HEADER_CONTEXT.lower())
-        signature = headers.get(HEADER_SIGNATURE.lower())
+        payload = _filled(headers.get(HEADER_CONTEXT.lower()))
+        signature = _filled(headers.get(HEADER_SIGNATURE.lower()))
         ctx = None
         if payload or signature:
             try:
@@ -79,6 +81,11 @@ class AuthContextMiddleware:
             await self.app(scope, receive, send)
         finally:
             _current.reset(token)
+
+
+def _filled(value: str | None) -> str | None:
+    """The header's value, or None for an unfilled `{placeholder}` (base64url never has braces)."""
+    return None if value and value.startswith("{") and value.endswith("}") else value
 
 
 async def _send_json(send: Any, status: int, body: dict) -> None:
