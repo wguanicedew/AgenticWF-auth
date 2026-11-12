@@ -11,8 +11,11 @@ from agenticwf_auth_cli import __main__ as cli
 from agenticwf_auth_cli.__main__ import main
 
 
+LOGTO_PAT = "urn:logto:token-type:personal_access_token"
+
+
 class FakeServer(BaseHTTPRequestHandler):
-    """Logto-like OIDC endpoints + a tiny API."""
+    """Logto-like OIDC endpoints (issuer <base>/oidc) + a tiny API."""
 
     state = {}
 
@@ -39,7 +42,7 @@ class FakeServer(BaseHTTPRequestHandler):
                                     "auth": "logto", "base_path": "/kb" if "/kb/" in self.path else ""})
         if self.path == "/app/auth/config":
             return self._send(200, {"auth_url": base, "api_url": base + "/app", "client_id": "cli",
-                                    "resource": "https://api.example.org",
+                                    "resource": "https://api.example.org", "pat_token_type": LOGTO_PAT,
                                     "scopes": "openid offline_access app:access knowledge:read"})
         if self.path == "/solo/kb/.well-known/agenticwf":
             return self._send(200, {"service": "kb", "mode": "standalone", "auth": "token", "base_path": "/kb",
@@ -48,7 +51,7 @@ class FakeServer(BaseHTTPRequestHandler):
             return self._send(403, {"error": "approval_pending", "error_description": "account is awaiting approval"})
         if self.path == "/api/v1/me":
             auth = self.headers.get("Authorization", "")
-            if auth != f"Bearer {self.state.get('valid')}":
+            if auth not in (f"Bearer {self.state.get('valid')}", "Bearer pat_direct"):
                 return self._send(401, {"error": "invalid_token"})
             return self._send(200, {"subject": "u1"})
         self._send(404, {})
@@ -142,6 +145,7 @@ def test_machine_to_machine(config):
 
 def test_personal_access_token(config, monkeypatch):
     config.personal_token = "pat_good"
+    config.pat_token_type = LOGTO_PAT       # exchanged (Logto); usually published at /auth/config
     client = Client(config)
     assert client.request("GET", "/api/v1/me") == {"subject": "u1"}
     client.access_token()  # cached in memory: one exchange
@@ -154,8 +158,32 @@ def test_personal_access_token(config, monkeypatch):
         client.login()
 
     config.personal_token = "pat_revoked"
+    config.pat_token_type = LOGTO_PAT
     with pytest.raises(AuthError, match="token revoked"):
         Client(config).access_token()
+
+
+def test_personal_access_token_sent_as_is(config):
+    """Nothing says to exchange it (Keycloak): authsvc resolves the PAT itself."""
+    config.personal_token = "pat_direct"
+    client = Client(config)
+    assert client.access_token() == "pat_direct"
+    assert client.request("GET", "/api/v1/me") == {"subject": "u1"}
+    assert not any(p == "/oidc/token" for p, _ in FakeServer.state.get("requests", []))
+
+
+def test_issuer_or_logto_endpoint(config):
+    """AGENTICWF_AUTH_URL is the issuer (<base>/oidc); a Logto endpoint (<base>) still works."""
+    config.client_secret = "s3cret"
+    for auth_url in (config.auth_url + "/oidc", config.auth_url):
+        config.auth_url = auth_url
+        assert Client(config).access_token() == "m2m"
+
+
+def test_no_resource_unless_set(config):
+    config.resource = None
+    Client(config, out=lambda m: None).login()
+    assert all("resource" not in f for _, f in FakeServer.state["requests"])
 
 
 def test_personal_access_token_from_env(server, tmp_path, monkeypatch):
@@ -163,6 +191,7 @@ def test_personal_access_token_from_env(server, tmp_path, monkeypatch):
                  "AGENTICWF_RESOURCE": "https://api.example.org"}.items():
         monkeypatch.setenv(k, v)
     monkeypatch.delenv("AGENTICWF_TOKEN", raising=False)
+    monkeypatch.setenv("AGENTICWF_PAT_TOKEN_TYPE", LOGTO_PAT)
     (tmp_path / "token").write_text("pat_good\n")
     monkeypatch.setenv("AGENTICWF_TOKEN_FILE", str(tmp_path / "token"))
     assert Client.from_env().access_token() == "from-pat"

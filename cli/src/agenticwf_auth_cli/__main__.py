@@ -44,10 +44,10 @@ def _command_plugins() -> list:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="agenticwf", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--auth-url", help="Logto URL (AGENTICWF_AUTH_URL)")
+    parser.add_argument("--auth-url", help="issuer URL of the identity provider (AGENTICWF_AUTH_URL)")
     parser.add_argument("--api-url", help="application URL (AGENTICWF_API_URL)")
-    parser.add_argument("--client-id", help="Logto application id (AGENTICWF_CLIENT_ID)")
-    parser.add_argument("--resource", help="API resource indicator (AGENTICWF_RESOURCE)")
+    parser.add_argument("--client-id", help="OIDC client id (AGENTICWF_CLIENT_ID)")
+    parser.add_argument("--resource", help="API resource indicator, if the provider needs one (AGENTICWF_RESOURCE)")
     parser.add_argument("--scopes", help="space separated scopes (AGENTICWF_SCOPES)")
     sub = parser.add_subparsers(dest="command", required=True)
     login = sub.add_parser("login")

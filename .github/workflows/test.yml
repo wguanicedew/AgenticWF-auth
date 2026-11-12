@@ -1,0 +1,42 @@
+name: Test
+
+# The provider-neutral auth service and the CLI. The containers are built by the provider
+# repositories (AgenticWF-auth-keycloak, AgenticWF-auth-logto) with this repository as a build context.
+on:
+  push:
+    branches: [main]
+    tags: ["*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Test auth service
+        working-directory: authsvc
+        env:
+          AUTHSVC_TEST_PG_DSN: postgresql://postgres:test@127.0.0.1:5432/postgres
+        run: |
+          pip install -e '.[test]'
+          pytest -q
+      - name: Test CLI client
+        working-directory: cli
+        run: |
+          pip install -e '.[test]'
+          pytest -q

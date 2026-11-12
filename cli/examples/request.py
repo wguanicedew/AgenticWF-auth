@@ -1,13 +1,9 @@
 """Calling the AgenticWF API from a Python script.
 
 Prerequisite (once per machine/user):   agenticwf login
-Machine/automation use instead:         export AGENTICWF_CLIENT_SECRET=...   (M2M app)
+Machine/automation use instead:         export AGENTICWF_CLIENT_ID=... AGENTICWF_CLIENT_SECRET=...
 
-    export AGENTICWF_AUTH_URL=https://auth.example.org
-    export AGENTICWF_API_URL=https://app.example.org
-    export AGENTICWF_CLIENT_ID=<Logto native app id>
-    export AGENTICWF_RESOURCE=https://api.example.org
-    export AGENTICWF_SCOPES="openid offline_access app:access agent:use knowledge:read"
+    export AGENTICWF_API_URL=https://app.example.org     # the rest is published at /auth/config
     python request.py
 """
 

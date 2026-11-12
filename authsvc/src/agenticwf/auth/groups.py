@@ -1,19 +1,21 @@
-"""Groups for the web UI (/auth/groups): Logto organizations, managed through the Management API.
+"""Groups for the web UI (/auth/groups), managed through the provider's admin API (``Directory``).
 
-A group is a Logto organization. Its members hold the organization role AUTH_GROUP_MEMBER_ROLE
-(default `member`); its admins also hold AUTH_GROUP_ADMIN_ROLE (default `admin`).
+What a group is depends on the provider: a top-level Keycloak group (admins: its `admins` subgroup),
+or a Logto organization (admins: the organization role `admin`). Here a group simply has members,
+some of whom are its admins.
 
     everyone (approved)   list the groups, see which are theirs, request to join one, cancel the
                           request, leave a group, list the members of their own groups
     a group's admins      add members (by email), remove them, make them admins or not, approve or
                           decline requests, rename the group
-    `admin` scope         all of the above for every group; create and delete groups
+    `admin` scope         all of the above for every group; create and delete groups (the creator
+                          becomes the new group's first admin)
 
 A group keeps at least one admin unless an `admin` scope holder changes it. Join requests are kept
-here (the session database), since Logto has none.
+here (the session database), since the providers have none.
 
-The backends learn a user's groups from the AuthContext: /verify adds the user's organizations
-(``AuthContext.organizations``), looked up through the Management API and cached per worker for
+The backends learn a user's groups from the AuthContext: /verify adds the user's groups
+(``AuthContext.organizations``), looked up through the Directory and cached per worker for
 AUTH_GROUP_CACHE_TTL seconds, so a membership change applies within that time without a new
 sign-in. The KB shares with them as ``org:<id>``.
 
@@ -36,7 +38,8 @@ from fastapi.responses import JSONResponse, Response
 from agenticwf.auth.authn import TokenVerifier
 from agenticwf.auth.config import Settings
 from agenticwf.auth.sessions import SessionManager
-from agenticwf.auth.tokens import ManagementClient, ManagementError, ManagementUnavailableError, signed_in
+from agenticwf.auth.directory import Directory, ManagementError, ManagementUnavailableError
+from agenticwf.auth.tokens import signed_in
 
 log = logging.getLogger("authsvc.groups")
 
@@ -49,12 +52,12 @@ RETRY_AFTER_FAILURE = 10
 # --- memberships ---------------------------------------------------------------------------------
 
 class _PerUser:
-    """Something about each user, from the Management API (`fetch`), cached for `ttl` seconds. When
-    the Management API fails, the last known answer stays (or none), retried after a few seconds."""
+    """Something about each user, from the Directory (`fetch`), cached for `ttl` seconds. When
+    the Directory fails, the last known answer stays (or none), retried after a few seconds."""
 
     what = "details"
 
-    def __init__(self, management: ManagementClient, ttl: int = 60, clock: Callable[[], float] = time.time):
+    def __init__(self, management: Directory, ttl: int = 60, clock: Callable[[], float] = time.time):
         self.management = management
         self.ttl = ttl
         self.clock = clock
@@ -91,29 +94,28 @@ class _PerUser:
 
 
 class Memberships(_PerUser):
-    """Each user's organizations ({org id: {"name", "roles"}})."""
+    """Each user's groups ({group id: {"name", "admin"}})."""
 
     what = "groups"
 
     def fetch(self, user_id: str) -> dict[str, dict]:
-        return {o["id"]: {"name": o.get("name") or o["id"], "roles": {r["name"] for r in o.get("organizationRoles") or ()}}
-                for o in self.management.user_organizations(user_id)}
+        return {g["id"]: {"name": g.get("name") or g["id"], "admin": bool(g.get("admin"))}
+                for g in self.management.user_groups(user_id)}
 
     def names(self, user_id: str) -> dict[str, str]:
-        return {org_id: m["name"] for org_id, m in self.of(user_id).items()}
+        return {group_id: m["name"] for group_id, m in self.of(user_id).items()}
 
 
 class Profiles(_PerUser):
-    """Each user's username, name and email (those set), for display: the access token has none."""
+    """Each user's username, name and email (those set), for providers whose access tokens carry
+    none (Logto). The email stands in for a missing username, so `username` always names a person."""
 
     what = "profile"
 
     def fetch(self, user_id: str) -> dict[str, str]:
         user = self.management.user(user_id)
-        # Accounts made while sign-up asked only for an email have no username: their email stands
-        # in, so `username` always names the user (e.g. knowledge bases `username:kb-name`).
-        found = {"username": user.get("username") or user.get("primaryEmail"), "name": user.get("name"),
-                 "email": user.get("primaryEmail")}
+        found = {"username": user.get("username") or user.get("email"), "name": user.get("name"),
+                 "email": user.get("email")}
         return {k: v for k, v in found.items() if isinstance(v, str) and v}
 
 
@@ -260,19 +262,10 @@ def _text(body: dict, key: str, limit: int) -> str:
     return value.strip()
 
 
-def build_router(settings: Settings, sessions: SessionManager, verifier: TokenVerifier, management: ManagementClient,
+def build_router(settings: Settings, sessions: SessionManager, verifier: TokenVerifier, management: Directory,
                  memberships: Memberships, requests: RequestStore,
                  required_scopes: frozenset[str] = frozenset()) -> APIRouter:
     router = APIRouter(prefix="/auth/groups")
-    role_ids: dict[str, str] = {}
-
-    def role_id(name: str) -> str:
-        if name not in role_ids:
-            role_ids.update(management.organization_role_ids())
-        if name not in role_ids:
-            raise GroupError(409, f"Logto has no organization role {name!r}: create it (Organization template) "
-                                  "or restart the container to have it created.")
-        return role_ids[name]
 
     class Caller:
         def __init__(self, session, scopes: set[str]):
@@ -287,7 +280,7 @@ def build_router(settings: Settings, sessions: SessionManager, verifier: TokenVe
             return org_id in self.groups
 
         def manages(self, org_id: str) -> bool:
-            return self.is_admin or settings.group_admin_role in self.groups.get(org_id, {}).get("roles", ())
+            return self.is_admin or bool(self.groups.get(org_id, {}).get("admin"))
 
     def handle(fn: Callable[..., Any]) -> Callable[..., Response]:
         """Run a route as the signed-in caller; errors become JSON answers."""
@@ -313,11 +306,9 @@ def build_router(settings: Settings, sessions: SessionManager, verifier: TokenVe
             raise GroupError(403, "Only the group's admins can do this.")
 
     def members_of(org_id: str) -> list[dict]:
-        out = []
-        for user in management.organization_members(org_id):
-            roles = {r["name"] for r in user.get("organizationRoles") or ()}
-            out.append({"user_id": user["id"], "name": user.get("name") or user.get("username") or "",
-                        "email": user.get("primaryEmail") or "", "admin": settings.group_admin_role in roles})
+        out = [{"user_id": user["id"], "name": user.get("name") or user.get("username") or "",
+                "email": user.get("email") or "", "admin": bool(user.get("admin"))}
+               for user in management.group_members(org_id)]
         return sorted(out, key=lambda m: (not m["admin"], (m["name"] or m["email"]).lower()))
 
     def keep_an_admin(caller: Caller, org_id: str, user_id: str) -> None:
@@ -328,14 +319,11 @@ def build_router(settings: Settings, sessions: SessionManager, verifier: TokenVe
         if admins == [user_id]:
             raise GroupError(409, "The group needs another admin first.")
 
-    def roles_for(admin: bool) -> list[str]:
-        return [role_id(settings.group_member_role)] + ([role_id(settings.group_admin_role)] if admin else [])
-
     def view(org: dict, caller: Caller, pending: dict[str, int], mine: set[str]) -> dict:
         org_id = org["id"]
         out = {"id": org_id, "group": f"org:{org_id}", "name": org.get("name") or org_id,
                "description": org.get("description") or "", "member": caller.member(org_id),
-               "admin": settings.group_admin_role in caller.groups.get(org_id, {}).get("roles", ()),
+               "admin": bool(caller.groups.get(org_id, {}).get("admin")),
                "requested": org_id in mine, "can_manage": caller.manages(org_id)}
         if out["can_manage"]:
             out["pending"] = pending.get(org_id, 0)
@@ -348,7 +336,7 @@ def build_router(settings: Settings, sessions: SessionManager, verifier: TokenVe
             pending: dict[str, int] = {}
             for r in requests.list():
                 pending[r.org_id] = pending.get(r.org_id, 0) + 1
-            groups = [view(o, caller, pending, mine) for o in management.organizations()]
+            groups = [view(o, caller, pending, mine) for o in management.groups()]
             groups.sort(key=lambda g: (not g["member"], g["name"].lower()))
             return {"groups": groups, "can_create": caller.is_admin}
         return handle(run)(request)
@@ -361,8 +349,16 @@ def build_router(settings: Settings, sessions: SessionManager, verifier: TokenVe
             name = _text(body, "name", 128)
             if not NAME_RE.fullmatch(name):
                 raise GroupError(400, "A group needs a name.")
-            org = management.create_organization(name, _text(body, "description", 1000))
+            org = management.create_group(name, _text(body, "description", 1000))
             log.info("group %s (%s) created by %s", org["id"], name, caller.id)
+            # Its creator is its first admin, so the group starts with one.
+            try:
+                management.add_member(org["id"], caller.id, admin=True)
+            except (ManagementError, ManagementUnavailableError) as exc:
+                log.warning("group %s: cannot make its creator %s an admin: %s", org["id"], caller.id, exc)
+            else:
+                memberships.forget(caller.id)
+                caller.groups = memberships.of(caller.id, fresh=True)
             return _no_store(JSONResponse(view(org, caller, {}, set()), status_code=201))
         return handle(run)(request)
 
@@ -377,7 +373,7 @@ def build_router(settings: Settings, sessions: SessionManager, verifier: TokenVe
                     raise GroupError(400, "A group needs a name.")
             if "description" in body:
                 fields["description"] = _text(body, "description", 1000)
-            org = management.update_organization(org_id, fields) if fields else management.organization(org_id)
+            org = management.update_group(org_id, fields) if fields else management.group(org_id)
             memberships.forget(*(m["user_id"] for m in members_of(org_id)))   # the name travels with the context
             return view(org, caller, {}, set())
         return handle(run)(request)
@@ -388,7 +384,7 @@ def build_router(settings: Settings, sessions: SessionManager, verifier: TokenVe
             if not caller.is_admin:
                 raise GroupError(403, "Only administrators can delete groups.")
             members = [m["user_id"] for m in members_of(org_id)]
-            management.delete_organization(org_id)
+            management.delete_group(org_id)
             requests.remove_group(org_id)
             memberships.forget(*members)
             log.info("group %s deleted by %s", org_id, caller.id)
@@ -400,7 +396,7 @@ def build_router(settings: Settings, sessions: SessionManager, verifier: TokenVe
         def run(caller: Caller):
             if not (caller.member(org_id) or caller.manages(org_id)):
                 raise GroupError(403, "Only the group's members can see who is in it.")
-            out: dict[str, Any] = {"group": view(management.organization(org_id), caller, {}, set()),
+            out: dict[str, Any] = {"group": view(management.group(org_id), caller, {}, set()),
                                    "members": members_of(org_id)}
             if caller.manages(org_id):
                 out["requests"] = [{"user_id": r.user_id, "name": r.name, "email": r.email, "message": r.message,
@@ -420,7 +416,7 @@ def build_router(settings: Settings, sessions: SessionManager, verifier: TokenVe
                 raise GroupError(404, "No user with this email: they need to sign up first.")
             if any(m["user_id"] == user["id"] for m in members_of(org_id)):
                 raise GroupError(409, "Already a member.")
-            management.add_member(org_id, user["id"], roles_for(bool(body.get("admin"))))
+            management.add_member(org_id, user["id"], admin=bool(body.get("admin")))
             requests.remove(org_id, user["id"])
             memberships.forget(user["id"])
             log.info("group %s: %s added by %s", org_id, user["id"], caller.id)
@@ -437,7 +433,7 @@ def build_router(settings: Settings, sessions: SessionManager, verifier: TokenVe
                 raise GroupError(404, "Not a member of this group.")
             if not body["admin"]:
                 keep_an_admin(caller, org_id, user_id)
-            management.set_member_roles(org_id, user_id, roles_for(body["admin"]))
+            management.set_admin(org_id, user_id, body["admin"])
             memberships.forget(user_id)
             log.info("group %s: %s admin=%s by %s", org_id, user_id, body["admin"], caller.id)
             return {"members": members_of(org_id)}
@@ -462,7 +458,7 @@ def build_router(settings: Settings, sessions: SessionManager, verifier: TokenVe
         def run(caller: Caller):
             if caller.member(org_id):
                 raise GroupError(409, "Already a member.")
-            management.organization(org_id)   # 404 for a group that does not exist
+            management.group(org_id)   # 404 for a group that does not exist
             requests.add(JoinRequest(org_id, caller.id, caller.name, caller.email,
                                      _text(body or {}, "message", 500), int(time.time())))
             log.info("group %s: %s asks to join", org_id, caller.id)
@@ -486,7 +482,7 @@ def build_router(settings: Settings, sessions: SessionManager, verifier: TokenVe
             if not any(r.user_id == user_id for r in requests.list(org_id=org_id)):
                 raise GroupError(404, "No such request.")
             if body["approve"] and not any(m["user_id"] == user_id for m in members_of(org_id)):
-                management.add_member(org_id, user_id, roles_for(False))
+                management.add_member(org_id, user_id, admin=False)
                 memberships.forget(user_id)
             requests.remove(org_id, user_id)
             log.info("group %s: request of %s %s by %s", org_id, user_id,

@@ -2,7 +2,7 @@
 
 Caddy routes ``<base>/auth/*`` on the application origin straight to authsvc (stripping
 the optional base path, e.g. ``/app``), so cookies are first-party and the web UI never
-handles Logto tokens. Browser-facing URLs built here always include the base path.
+handles the provider's tokens. Browser-facing URLs built here always include the base path.
 
 Cookie: ``__Host-agenticwf_session`` (Secure, HttpOnly, SameSite=Lax, Path=/, no Domain).
 CSRF: SameSite=Lax plus an Origin check on state-changing requests and WebSocket upgrades
@@ -23,7 +23,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 
 from agenticwf.auth.authn import AuthenticationError, AuthUnavailableError, TokenVerifier
 from agenticwf.auth.config import Settings
-from agenticwf.auth.oidc import LogtoClient, OIDCError, OIDCUnavailableError
+from agenticwf.auth.oidc import OIDCClient, OIDCError, OIDCUnavailableError
 from agenticwf.auth.sessions import SessionManager
 from agenticwf.auth import telemetry
 from agenticwf.auth.signing import b64e, seal, unseal
@@ -33,12 +33,13 @@ log = logging.getLogger("agenticwf.auth.web")
 SESSION_COOKIE = "__Host-agenticwf_session"
 LOGIN_COOKIE = "__Host-agenticwf_login"
 LOGIN_TTL = 600
+RETRY_MARK = ".r"  # suffix of the state of a login restarted by the callback
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 
 def safe_return_to(value: str | None, base: str = "") -> str:
     """Only same-origin paths inside the application; blocks open redirects like
-    //evil.com or /\\evil.com, and redirects into other apps sharing the host (Logto)."""
+    //evil.com or /\\evil.com, and redirects into other apps sharing the host (the identity provider)."""
     home = f"{base}/"
     if not value or not value.startswith("/") or value.startswith("//") or "\\" in value:
         return home
@@ -78,6 +79,12 @@ def wants_html(method: str, headers) -> bool:
     return method.upper() == "GET" and "text/html" in headers.get("accept", "") and not is_websocket(headers)
 
 
+def is_login_path(path: str, base: str = "") -> bool:
+    """``path`` (as /verify sees it) is one of authsvc's own browser-login endpoints: the proxy
+    should send those to authsvc directly, never through forward_auth."""
+    return any(path == p or path.startswith(p + "/") for p in {"/auth", f"{base}/auth"})
+
+
 def login_redirect(uri: str, base: str = "") -> RedirectResponse:
     """``uri`` is the request URI as seen behind Caddy (base path already stripped)."""
     target = safe_return_to(f"{base}{uri}", base)
@@ -90,6 +97,14 @@ def set_session_cookie(response: Response, raw: str, max_age: int) -> None:
 
 def clear_session_cookie(response: Response) -> None:
     response.delete_cookie(SESSION_COOKIE, path="/", secure=True, httponly=True, samesite="lax")
+
+
+def end_rejected_session(sessions: SessionManager, raw: str | None, exc: AuthenticationError) -> None:
+    """A session whose access token no longer verifies (issued by the previous identity provider,
+    a signing key that is gone, ...): delete it, so the cookie is stale and the browser signs in
+    again. The caller clears the cookie on its response."""
+    log.info("ending browser session whose token is rejected: %s", exc.description)
+    sessions.end(raw)
 
 
 def _no_store(response: Response) -> Response:
@@ -145,21 +160,35 @@ this page needs. Ask an administrator for access if you need it.</p>
     return _no_store(HTMLResponse(body, status_code=403))  # type: ignore[return-value]
 
 
-def build_router(settings: Settings, sessions: SessionManager, client: LogtoClient, verifier: TokenVerifier,
-                 required_scopes: frozenset[str] = frozenset()) -> APIRouter:
+def build_router(settings: Settings, sessions: SessionManager, client: OIDCClient, verifier: TokenVerifier,
+                 required_scopes: frozenset[str] = frozenset(), return_blocked: tuple[str, ...] = ()) -> APIRouter:
+    """``return_blocked``: path prefixes of the identity provider on the application's origin."""
     router = APIRouter(prefix="/auth")
     login_key = settings.context_secret
     base = settings.app_base_path
+    # The provider's paths when it shares the application's origin: never a place to return to.
+    blocked = tuple(p.rstrip("/") for p in return_blocked if p.rstrip("/"))
+
+    def return_target(value: str | None) -> str:
+        target = safe_return_to(value, base)
+        path = unquote(target.split("?", 1)[0].split("#", 1)[0])
+        if any(path == p or path.startswith(p + "/") for p in blocked):
+            return f"{base}/"
+        return target
 
     @router.get("/login")
-    def login(return_to: str | None = None) -> Response:
+    def login(return_to: str | None = None, retry: str | None = None) -> Response:
         verifier_raw = secrets.token_urlsafe(48)
         state, nonce = secrets.token_urlsafe(24), secrets.token_urlsafe(24)
+        if retry:
+            # A login restarted by the callback (its login cookie was gone): marked in the state, so
+            # a browser that drops the cookie again gets an error instead of an endless loop.
+            state += RETRY_MARK
         challenge = b64e(hashlib.sha256(verifier_raw.encode()).digest())
         response = RedirectResponse(client.authorization_url(state, nonce, challenge), status_code=302)
         response.set_cookie(
             LOGIN_COOKIE,
-            seal(login_key, "login", {"s": state, "n": nonce, "v": verifier_raw, "r": safe_return_to(return_to, base)}, LOGIN_TTL),
+            seal(login_key, "login", {"s": state, "n": nonce, "v": verifier_raw, "r": return_target(return_to)}, LOGIN_TTL),
             max_age=LOGIN_TTL, path="/", secure=True, httponly=True, samesite="lax",
         )
         return _no_store(response)
@@ -171,7 +200,14 @@ def build_router(settings: Settings, sessions: SessionManager, client: LogtoClie
             pending = unseal(login_key, "login", request.cookies.get(LOGIN_COOKIE))
         except ValueError:
             telemetry.record_login("expired")
-            return _error_page(400, "Login expired or was started in another browser; please retry.")
+            if state and state.endswith(RETRY_MARK):
+                return _error_page(400, "Sign-in needs cookies: allow cookies for this site and retry.")
+            # The login cookie expired (LOGIN_TTL), or the login was started in another browser, or the
+            # callback URL was reopened (back button, bookmark, the email verification link opened in
+            # another browser): start a new login instead of showing an error. With the identity
+            # provider's session still valid it passes without a prompt. Where to return to was in
+            # the lost cookie, so this goes to the application's start page.
+            return _no_store(RedirectResponse(f"{base}/auth/login?retry=1", status_code=302))
         if error:
             telemetry.record_login("provider_error")
             return _error_page(400, f"{error}: {error_description or ''}".strip(": "))
@@ -183,9 +219,9 @@ def build_router(settings: Settings, sessions: SessionManager, client: LogtoClie
             tokens = client.exchange_code(code, pending["v"])
             if not tokens.id_token:
                 telemetry.record_login("rejected_token")
-                return _error_page(502, "Logto returned no ID token (is 'openid' in AUTH_WEB_SCOPES?)")
+                return _error_page(502, "The identity provider returned no ID token (is 'openid' in AUTH_WEB_SCOPES?)")
             id_claims = verifier.verify_id_token(tokens.id_token, settings.web_client_id or "", pending["n"])
-            verifier.verify(tokens.access_token)  # must be a JWT for this API resource
+            verifier.verify(tokens.access_token)  # must be a JWT for this API (its audience)
         except OIDCError as exc:
             log.warning("code exchange failed: %s", exc)
             telemetry.record_login("provider_error")
@@ -198,7 +234,9 @@ def build_router(settings: Settings, sessions: SessionManager, client: LogtoClie
             telemetry.record_login("unavailable")
             return _error_page(503, "Identity service unavailable; please retry.")
 
-        user_info = {k: id_claims[k] for k in ("name", "email", "picture", "username") if id_claims.get(k)}
+        user_info = {k: id_claims[k] for k in ("name", "email", "picture") if id_claims.get(k)}
+        if id_claims.get("preferred_username") or id_claims.get("username"):
+            user_info["username"] = id_claims.get("preferred_username") or id_claims["username"]
         # Signing in again (e.g. "Check again" after approval) replaces the previous session.
         sessions.end(request.cookies.get(SESSION_COOKIE))  # revocation is best effort
         raw, _ = sessions.start(tokens, id_claims["sub"], user_info)
@@ -225,12 +263,12 @@ def build_router(settings: Settings, sessions: SessionManager, client: LogtoClie
     def recheck(request: Request, return_to: str | None = None) -> Response:
         """Pick up roles assigned since sign-in ("Check again" on the approval page).
 
-        A refreshed token can only carry the scopes granted at sign-in, so a newly granted
-        scope such as app:access needs a new authorization. Try the cheap refresh first; if
-        the account still is not approved, re-run the login. Logto's own session is still
+        Try the cheap refresh first: some providers (Keycloak) put the current roles into a
+        refreshed token. Others (Logto) can only keep the permissions granted at sign-in, so if
+        the account still is not approved, re-run the login: the provider's own session is still
         valid, so that passes without prompting and the new grant reflects the current roles.
         """
-        target = safe_return_to(return_to, base)
+        target = return_target(return_to)
         relogin = _no_store(RedirectResponse(f"{base}/auth/login?return_to={quote(target, safe='')}", status_code=302))
         try:
             session = sessions.refresh_now(request.cookies.get(SESSION_COOKIE))
@@ -239,8 +277,12 @@ def build_router(settings: Settings, sessions: SessionManager, client: LogtoClie
         if session is None:
             return relogin
         try:
-            scopes = set((verifier.verify(session.access_token).get("scope") or "").split())
-        except (AuthenticationError, AuthUnavailableError):
+            scopes = set(verifier.context(session.access_token, "session").scopes)
+        except AuthenticationError as exc:
+            end_rejected_session(sessions, request.cookies.get(SESSION_COOKIE), exc)
+            clear_session_cookie(relogin)
+            return relogin
+        except AuthUnavailableError:
             return relogin
         if not required_scopes <= scopes:
             return relogin
@@ -253,22 +295,27 @@ def build_router(settings: Settings, sessions: SessionManager, client: LogtoClie
             session = sessions.resolve(request.cookies.get(SESSION_COOKIE))
         except OIDCUnavailableError:
             return _error_page(503, "Identity service unavailable.")
+        signed_out = JSONResponse({"authenticated": False, "login_url": f"{base}/auth/login"})
         if session is None:
-            response = JSONResponse({"authenticated": False, "login_url": f"{base}/auth/login"})
             if request.cookies.get(SESSION_COOKIE):
-                clear_session_cookie(response)
-            return _no_store(response)
+                clear_session_cookie(signed_out)
+            return _no_store(signed_out)
         try:
-            claims = verifier.verify(session.access_token)
-        except (AuthenticationError, AuthUnavailableError):
-            claims = {}
-        scopes = set((claims.get("scope") or "").split())
+            ctx = verifier.context(session.access_token, "session")
+            scopes, organization_id = set(ctx.scopes), ctx.organization_id
+        except AuthenticationError as exc:
+            # Not a usable sign-in at all (not merely unapproved): the UI then goes to login_url.
+            end_rejected_session(sessions, request.cookies.get(SESSION_COOKIE), exc)
+            clear_session_cookie(signed_out)
+            return _no_store(signed_out)
+        except AuthUnavailableError:
+            scopes, organization_id = set(), None
         return _no_store(JSONResponse({
             "authenticated": True,
             "approved": required_scopes <= scopes,
             "user": {"id": session.subject, **session.user_info},
-            "organization_id": claims.get("organization_id"),
-            "scopes": sorted((claims.get("scope") or "").split()),
+            "organization_id": organization_id,
+            "scopes": sorted(scopes),
             "session_expires_at": session.expires_at,
             "account_url": settings.account_url,
         }))

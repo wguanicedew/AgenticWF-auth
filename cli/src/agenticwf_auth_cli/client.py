@@ -2,8 +2,9 @@
 
 Credentials, in order of preference:
   * AGENTICWF_CLIENT_SECRET set -> machine-to-machine (client credentials), no user involved
-  * AGENTICWF_TOKEN set -> a personal access token (created in the web UI under Admin > Tokens),
-    exchanged for short-lived access tokens (token exchange); for scripts and CI
+  * AGENTICWF_TOKEN set -> a personal access token (created in the web UI under Admin > Tokens);
+    for scripts and CI. Sent as it is (authsvc resolves it: Keycloak), or, when the application
+    publishes a `pat_token_type` (Logto), exchanged for short-lived access tokens (token exchange)
   * otherwise -> cached user tokens from `agenticwf login` (OAuth 2.0 device flow),
     refreshed automatically with the refresh token
 
@@ -11,9 +12,10 @@ Credentials, in order of preference:
 tokens above, or directly with the service's own token (a personal agent, a standalone KB).
 
 Only a URL is needed: a service publishes how it signs clients in at <its URL>/.well-known/agenticwf,
-and behind Caddy authsvc publishes the Logto settings (AGENTICWF_AUTH_URL, _API_URL, _CLIENT_ID,
-_RESOURCE, and the scopes to ask for: _SCOPES) at <application URL>/auth/config. Variables that are
-set take precedence.
+and behind Caddy authsvc publishes the sign-in settings at <application URL>/auth/config: AGENTICWF_AUTH_URL
+(the provider's issuer URL), _API_URL, _CLIENT_ID, the scopes to ask for (_SCOPES) and what the provider
+needs besides: an API resource indicator (_RESOURCE, Logto) and how personal access tokens are used
+(_PAT_TOKEN_TYPE, Logto). Variables that are set take precedence.
 """
 
 from __future__ import annotations
@@ -34,12 +36,15 @@ from agenticwf_auth_cli.tls import ssl_context
 
 DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
 TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange"
-PAT_TOKEN_TYPE = "urn:logto:token-type:personal_access_token"
 EXPIRY_MARGIN = 60
 WELL_KNOWN = "/.well-known/agenticwf"   # a service's: {service, mode, auth, base_path, token_help}
 CLIENT_CONFIG = "/auth/config"          # authsvc's, under the application URL: the Config fields
-REQUIRED = ("auth_url", "api_url", "client_id", "resource")
+REQUIRED = ("auth_url", "api_url", "client_id")
+PUBLISHED = (*REQUIRED, "scopes", "resource", "pat_token_type")
 DEFAULT_SCOPES = "openid offline_access"
+# `auth` values of a service's /.well-known/agenticwf meaning "signs in through authsvc", whatever
+# the identity provider behind it.
+AUTHSVC_AUTH = ("authsvc", "oidc", "logto", "keycloak")
 
 
 class AuthError(Exception):
@@ -55,13 +60,14 @@ class ApiError(Exception):
 
 @dataclass
 class Config:
-    auth_url: str  # public Logto endpoint, e.g. https://auth.example.org
+    auth_url: str  # the provider's issuer, e.g. https://auth.example.org/oidc (Logto: its endpoint works too)
     api_url: str  # application, e.g. https://app.example.org
-    client_id: str  # Logto Native app (device flow) or M2M app
-    resource: str  # Logto API resource indicator
+    client_id: str  # public client (device flow) or confidential client (client credentials)
     scopes: Optional[str] = None  # None: what the application publishes (Client.scopes)
     client_secret: Optional[str] = None  # set -> client credentials
-    personal_token: Optional[str] = None  # set -> exchange this PAT for access tokens
+    personal_token: Optional[str] = None  # set -> a personal access token
+    resource: Optional[str] = None  # API resource indicator sent with token requests (Logto); None: none
+    pat_token_type: Optional[str] = None  # set -> PATs are exchanged (subject_token_type); None: published, else sent as they are
     cache_file: Path = Path.home() / ".config" / "agenticwf" / "credentials.json"
 
     @classmethod
@@ -74,10 +80,11 @@ class Config:
             "auth_url": env("AGENTICWF_AUTH_URL"),
             "api_url": env("AGENTICWF_API_URL"),
             "client_id": env("AGENTICWF_CLIENT_ID"),
-            "resource": env("AGENTICWF_RESOURCE"),
             "scopes": env("AGENTICWF_SCOPES"),
             "client_secret": env("AGENTICWF_CLIENT_SECRET"),
             "personal_token": env("AGENTICWF_TOKEN"),
+            "resource": env("AGENTICWF_RESOURCE"),
+            "pat_token_type": env("AGENTICWF_PAT_TOKEN_TYPE"),
         }
         if not values["personal_token"] and env("AGENTICWF_TOKEN_FILE"):
             values["personal_token"] = Path(env("AGENTICWF_TOKEN_FILE")).expanduser().read_text().strip() or None
@@ -99,7 +106,7 @@ class Config:
 
     @property
     def cache_key(self) -> str:
-        return f"{self.auth_url}|{self.client_id}|{self.resource}"
+        return f"{self.auth_url}|{self.client_id}|{self.resource or ''}"
 
 
 def _http(method: str, url: str, form: Optional[dict] = None, body: Any = None,
@@ -164,6 +171,7 @@ class Client:
         self.cache = TokenCache(config.cache_file)
         self.out = out
         self._discovery: Optional[dict] = None
+        self._published: Optional[dict] = None
         self._issued: Optional[dict] = None  # client credentials / PAT exchange; kept in memory only
 
     @classmethod
@@ -174,13 +182,19 @@ class Client:
     @property
     def discovery(self) -> dict:
         if self._discovery is None:
-            status, body = _http("GET", f"{self.config.auth_url}/oidc/.well-known/openid-configuration")
-            if status != 200 or not isinstance(body, dict):
-                raise AuthError(f"OIDC discovery failed ({status})")
-            self._discovery = body
+            # The issuer's discovery document; for a Logto endpoint given instead of its issuer, /oidc.
+            for issuer in (self.config.auth_url, self.config.auth_url + "/oidc"):
+                status, body = _http("GET", f"{issuer}/.well-known/openid-configuration")
+                if status == 200 and isinstance(body, dict):
+                    self._discovery = body
+                    break
+            else:
+                raise AuthError(f"OIDC discovery failed at {self.config.auth_url} ({status})")
         return self._discovery
 
     def _token_request(self, form: dict) -> tuple[int, dict]:
+        if self.config.resource:
+            form = {**form, "resource": self.config.resource}
         auth = (self.config.client_id, self.config.client_secret) if self.config.client_secret else None
         if not auth:
             form = {**form, "client_id": self.config.client_id}
@@ -192,13 +206,27 @@ class Client:
         body["expires_at"] = int(time.time()) + int(body.get("expires_in", 3600))
         return body
 
+    def published(self) -> dict:
+        """The application's /auth/config (authsvc), {} when there is none."""
+        if self._published is None:
+            self._published = _get_json(self.config.api_url + CLIENT_CONFIG) or {}
+        return self._published
+
     def scopes(self) -> str:
-        """AGENTICWF_SCOPES, else the application's (authsvc /auth/config: the browser sign-in's), else
-        openid offline_access. Logto puts in a token only the API permissions asked for (and granted)."""
+        """AGENTICWF_SCOPES, else the application's (authsvc /auth/config), else openid offline_access.
+        Some providers (Logto) put in a token only the API permissions asked for; others (Keycloak)
+        those of the user's roles, and `offline_access` makes the sign-in outlast the browser session."""
         if not self.config.scopes:
-            published = (_get_json(self.config.api_url + CLIENT_CONFIG) or {}).get("scopes")
+            published = self.published().get("scopes")
             self.config.scopes = published if isinstance(published, str) and published.strip() else DEFAULT_SCOPES
         return self.config.scopes
+
+    def pat_token_type(self) -> Optional[str]:
+        """How PATs are used: exchanged with this subject_token_type (Logto), or None: sent as they are."""
+        if self.config.pat_token_type is None:
+            published = self.published().get("pat_token_type")
+            self.config.pat_token_type = published if isinstance(published, str) else ""
+        return self.config.pat_token_type or None
 
     # --- login flows -----------------------------------------------------------------
     def login(self) -> dict:
@@ -211,9 +239,11 @@ class Client:
             raise AuthError("AGENTICWF_TOKEN is set: a personal access token needs no login")
         endpoint = self.discovery.get("device_authorization_endpoint")
         if not endpoint:
-            raise AuthError("Logto does not advertise a device_authorization_endpoint")
-        status, device = _http("POST", endpoint, form={
-            "client_id": self.config.client_id, "scope": self.scopes(), "resource": self.config.resource})
+            raise AuthError("the identity provider does not advertise a device_authorization_endpoint")
+        form = {"client_id": self.config.client_id, "scope": self.scopes()}
+        if self.config.resource:
+            form["resource"] = self.config.resource
+        status, device = _http("POST", endpoint, form=form)
         if status != 200 or not isinstance(device, dict):
             raise AuthError(f"device authorization failed: {device}")
 
@@ -229,8 +259,7 @@ class Client:
         deadline = time.time() + int(device.get("expires_in", 600))
         while time.time() < deadline:
             time.sleep(interval)
-            status, body = self._token_request({
-                "grant_type": DEVICE_GRANT, "device_code": device["device_code"], "resource": self.config.resource})
+            status, body = self._token_request({"grant_type": DEVICE_GRANT, "device_code": device["device_code"]})
             if status == 200 and "access_token" in body:
                 tokens = self._stamp(body)
                 self.cache.put(self.config.cache_key, tokens)
@@ -255,18 +284,22 @@ class Client:
     def access_token(self) -> str:
         """A valid access token, refreshing or re-acquiring as needed."""
         now = time.time()
-        # A machine client asks for what AGENTICWF_SCOPES says; a person's token for what they sign in with.
-        scopes = (self.config.scopes or DEFAULT_SCOPES) if self.config.client_secret else self.scopes()
-        api_scopes = " ".join(s for s in scopes.split() if s not in ("openid", "offline_access"))
+        if self.config.personal_token and not self.config.client_secret and not self.pat_token_type():
+            return self.config.personal_token     # authsvc resolves it (agenticwf.auth.pats)
         if self.config.client_secret or self.config.personal_token:
             if not self._issued or self._issued["expires_at"] - now < EXPIRY_MARGIN:
                 if self.config.client_secret:
-                    form, what = {"grant_type": "client_credentials"}, "client credentials"
+                    # A machine client asks for what AGENTICWF_SCOPES says (Keycloak: its roles anyway).
+                    scopes, what = self.config.scopes or "", "client credentials"
+                    form = {"grant_type": "client_credentials"}
                 else:
+                    scopes, what = self.scopes(), "personal access token (expired or revoked?)"
                     form = {"grant_type": TOKEN_EXCHANGE_GRANT, "subject_token": self.config.personal_token,
-                            "subject_token_type": PAT_TOKEN_TYPE}
-                    what = "personal access token (expired or revoked?)"
-                status, body = self._token_request({**form, "resource": self.config.resource, "scope": api_scopes})
+                            "subject_token_type": self.pat_token_type()}
+                api_scopes = " ".join(s for s in scopes.split() if s not in ("openid", "offline_access"))
+                if api_scopes:
+                    form["scope"] = api_scopes
+                status, body = self._token_request(form)
                 if status != 200 or "access_token" not in body:
                     raise AuthError(f"{what} rejected: {body.get('error')}: {body.get('error_description', '')}")
                 self._issued = self._stamp(body)
@@ -279,8 +312,7 @@ class Client:
             return tokens["access_token"]
         if not tokens.get("refresh_token"):
             raise AuthError("session expired; run `agenticwf login`")
-        status, body = self._token_request({
-            "grant_type": "refresh_token", "refresh_token": tokens["refresh_token"], "resource": self.config.resource})
+        status, body = self._token_request({"grant_type": "refresh_token", "refresh_token": tokens["refresh_token"]})
         if status != 200 or "access_token" not in body:
             self.cache.put(self.config.cache_key, None)
             raise AuthError("session expired; run `agenticwf login`")
@@ -322,24 +354,25 @@ def _link_token(url: str) -> tuple[str, Optional[str]]:
 
 
 def describe(url: str) -> Optional[dict]:
-    """How the service at `url` signs clients in (its /.well-known/agenticwf): `auth` is "logto"
-    (behind Caddy and authsvc), "token" (its own token) or "none"; `base_path` is where it lives
+    """How the service at `url` signs clients in (its /.well-known/agenticwf): `auth` is "authsvc"
+    (behind Caddy and authsvc; "oidc", "logto" and "keycloak" mean the same), "token" (its own token)
+    or "none"; `base_path` is where it lives
     under the application URL. None when it publishes nothing (an older server, or unreachable)."""
     return _get_json(_link_token(url)[0] + WELL_KNOWN)
 
 
 def sign_in_settings(url: str, about: Optional[dict] = None) -> dict:
-    """The Logto settings (Config fields auth_url, api_url, client_id, resource) of the application
+    """The sign-in settings (Config fields auth_url, api_url, client_id, scopes) of the application
     behind the service at `url` (or the application URL itself): authsvc's /auth/config at the
     service URL without its base_path. `about` is the service's `describe`. Empty when not found."""
     url = _link_token(url)[0]
     about = describe(url) if about is None else about
-    if not about or about.get("auth") != "logto":
+    if not about or about.get("auth") not in AUTHSVC_AUTH:
         return {}
     base = (about.get("base_path") or "").rstrip("/")
     app = url[:-len(base)] if base and url.endswith(base) else url
     found = {k: v.rstrip("/") for k, v in (_get_json(app + CLIENT_CONFIG) or {}).items()
-             if k in (*REQUIRED, "scopes") and isinstance(v, str) and v}
+             if k in PUBLISHED and isinstance(v, str) and v}
     return {"api_url": app, **found} if found else {}
 
 
@@ -354,9 +387,9 @@ def service_access(service: str, path: str, url: Optional[str] = None, token: Op
 
     AGENTICWF_<SERVICE>_TOKEN (or _TOKEN_FILE, or a sign-in link …/?token=… as the URL) is the
     service's own token, sent as it is: the personal agent's (`agenticwf-agent token`) or a
-    standalone KB's (`agenticwf-kb token`). Without one, and unless the Logto settings are all set,
+    standalone KB's (`agenticwf-kb token`). Without one, and unless the sign-in settings are all set,
     the service tells how it signs clients in (`describe`): with its own token (then `token_file`, when it exists and the service is on this
-    machine), or with Logto as for `agenticwf token`, whose settings the application publishes
+    machine), or through authsvc as for `agenticwf token`, whose settings the application publishes
     (`sign_in_settings`), so AGENTICWF_<SERVICE>_URL alone is enough. Without that URL, it is
     AGENTICWF_API_URL + `path` (where Caddy serves the service). `url`, `token` and `overrides`
     (Config fields) take precedence over the environment."""
@@ -368,7 +401,7 @@ def service_access(service: str, path: str, url: Optional[str] = None, token: Op
     token = token or env(prefix + "TOKEN") or linked
     if not token and env(prefix + "TOKEN_FILE"):
         token = Path(env(prefix + "TOKEN_FILE")).expanduser().read_text().strip() or None
-    # Asked only when the Logto settings are not all set: then they are what the service uses.
+    # Asked only when the sign-in settings are not all set: then they are what the service uses.
     configured = all(overrides.get(k) or env(f"AGENTICWF_{k.upper()}") for k in REQUIRED)
     about = describe(url) if url and not token and not configured else None
     if about and about.get("auth") == "token" and token_file and _is_loopback(url):
@@ -383,7 +416,7 @@ def service_access(service: str, path: str, url: Optional[str] = None, token: Op
         how = f"; to get it: {about['token_help']}" if about.get("token_help") else ""
         raise AuthError(f"{url} is a {service} with its own token ({about.get('mode')} mode): set {prefix}TOKEN "
                         f"(or {prefix}TOKEN_FILE), or {prefix}URL to its sign-in link (…/?token=…){how}")
-    if about and about.get("auth") not in (None, "logto"):
+    if about and about.get("auth") not in (None, *AUTHSVC_AUTH):
         raise AuthError(f"{url} takes no sign-ins ({about.get('mode')} mode: for other services only)")
     try:
         discovered = sign_in_settings(url, about) if about else None

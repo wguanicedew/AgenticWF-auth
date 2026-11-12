@@ -44,12 +44,15 @@ def test_public_route_ignores_bad_token(settings, verifier):
 def test_client_config_is_public(settings, verifier):
     from dataclasses import replace
 
-    s = replace(settings, logto_endpoint="https://host", app_origin="https://host", app_base_path="/app",
-                cli_client_id="cli_1")
+    s = replace(settings, app_origin="https://host", app_base_path="/app", cli_client_id="cli_1")
     r = client(s, verifier).get("/auth/config")
     assert r.status_code == 200
-    assert r.json() == {"auth_url": "https://host", "api_url": "https://host/app", "client_id": "cli_1",
-                        "resource": settings.resource, "scopes": settings.web_scopes}
+    assert r.json() == {"auth_url": settings.issuer, "api_url": "https://host/app", "client_id": "cli_1",
+                        "scopes": "openid offline_access"}
+    from agenticwf.auth.provider import Provider
+
+    r = TestClient(create_app(settings=s, verifier=verifier, provider=Provider(client_config={"resource": "r"})))
+    assert r.get("/auth/config").json()["resource"] == "r"            # the provider's extras
 
 
 def test_whoami(settings, verifier, make_token):

@@ -1,16 +1,17 @@
-"""Authentication: verify Logto-issued JWT access tokens."""
+"""Authentication: verify JWT access tokens of the identity provider."""
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 import jwt
 from jwt import PyJWKClient
 
 from agenticwf.auth.config import Settings
+from agenticwf.auth.context import AuthContext
 
-# Logto signs with EC (ES384 by default) or RSA keys. Symmetric algorithms are never
-# accepted, which rules out alg-confusion attacks.
+# Providers sign with EC or RSA keys. Symmetric algorithms are never accepted, which rules out
+# alg-confusion attacks (and HS-signed Keycloak refresh tokens).
 ALLOWED_ALGORITHMS = ["ES256", "ES384", "ES512", "RS256", "RS384", "RS512", "PS256", "PS384", "PS512"]
 
 
@@ -24,7 +25,7 @@ class AuthenticationError(Exception):
 
 
 class AuthUnavailableError(Exception):
-    """Signing keys could not be fetched; fail closed (HTTP 503)."""
+    """Signing keys (or a credential's owner) could not be fetched; fail closed (HTTP 503)."""
 
 
 def extract_bearer(authorization: str | None) -> str | None:
@@ -48,7 +49,11 @@ def audience_matches(token_aud: Any, accepted: tuple[str, ...]) -> bool:
 
 
 class TokenVerifier:
-    def __init__(self, settings: Settings, jwks_client: PyJWKClient | None = None):
+    """Verifies access tokens; ``claims`` and ``check_claims`` are the provider's (agenticwf.auth.provider)."""
+
+    def __init__(self, settings: Settings, jwks_client: PyJWKClient | None = None,
+                 claims: Callable[[dict[str, Any]], AuthContext] | None = None,
+                 check_claims: Callable[[dict[str, Any]], None] | None = None):
         self._settings = settings
         self._jwks = jwks_client or PyJWKClient(
             settings.jwks_uri,
@@ -56,13 +61,22 @@ class TokenVerifier:
             lifespan=settings.jwks_cache_ttl,
             timeout=5,
         )
+        self._claims = claims or (lambda c: AuthContext.from_claims(c, settings.roles_claim,
+                                                                    settings.external_identity_claim))
+        self._check = check_claims
 
     def verify(self, token: str) -> dict[str, Any]:
-        """Verify a Logto access token for this API."""
+        """Verify an access token for this API; returns its claims."""
         claims = self._decode(token)
+        if self._check is not None:
+            self._check(claims)
         if not audience_matches(claims.get("aud"), self._settings.audiences):
             raise AuthenticationError("invalid_token", "Token audience is not accepted by this API")
         return claims
+
+    def context(self, token: str, auth_method: str = "bearer") -> AuthContext:
+        """The AuthContext of a verified access token."""
+        return self._claims(self.verify(token)).with_method(auth_method)
 
     def verify_id_token(self, token: str, client_id: str, nonce: str) -> dict[str, Any]:
         """Verify an OIDC ID token from the browser login flow."""
@@ -75,12 +89,12 @@ class TokenVerifier:
 
     def _decode(self, token: str) -> dict[str, Any]:
         try:
-            # Unknown `kid` triggers one JWKS refresh, so Logto key rotation is picked up.
+            # Unknown `kid` triggers one JWKS refresh, so the provider's key rotation is picked up.
             signing_key = self._jwks.get_signing_key_from_jwt(token)
         except jwt.PyJWKClientConnectionError as exc:
             raise AuthUnavailableError(str(exc)) from exc
         except (jwt.PyJWKClientError, jwt.DecodeError) as exc:
-            # Includes opaque (non-JWT) tokens, issued by Logto when no API resource was requested.
+            # Includes opaque (non-JWT) tokens.
             raise AuthenticationError("invalid_token", f"Malformed or unknown token: {exc}") from exc
 
         try:

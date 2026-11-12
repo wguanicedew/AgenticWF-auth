@@ -1,7 +1,8 @@
 # agenticwf-auth-client
 
 The `agenticwf` command for [AgenticWF](https://github.com/InnovateAILab/AgenticWF): sign-in
-(OAuth device flow via Logto), access tokens, and calls to the AgenticWF API. Standard library only.
+(OAuth device flow through the server's identity provider, Keycloak or Logto), access tokens, and calls to
+the AgenticWF API. Standard library only.
 
 ```bash
 pip install agenticwf-auth-client
@@ -11,7 +12,7 @@ agenticwf whoami
 agenticwf call GET /api/v1/me
 ```
 
-Behind the AgenticWF server (Caddy, Logto) the commands sign in with `agenticwf login`. The
+Behind the AgenticWF server (Caddy, authsvc) the commands sign in with `agenticwf login`. The
 application URL is enough: authsvc publishes the rest at `<application URL>/auth/config`, and a
 service's URL works as well (`AGENTICWF_KB_URL`, `AGENTICWF_AGENT_URL`):
 
@@ -20,17 +21,19 @@ export AGENTICWF_API_URL=https://host.example.org/app
 agenticwf login
 ```
 
-Variables that are set take precedence over what is published (an administrator gets the values
-with `docker exec agenticwf cat /var/lib/agenticwf/logto/clients.env`):
+Variables that are set take precedence over what is published:
 
 ```bash
-export AGENTICWF_AUTH_URL=https://host.example.org
-export AGENTICWF_CLIENT_ID=<Logto native app id>
-export AGENTICWF_RESOURCE=<API resource indicator>
+export AGENTICWF_AUTH_URL=<issuer URL>      # Keycloak: https://host/idp/realms/agenticwf; Logto: https://host/oidc
+export AGENTICWF_CLIENT_ID=<the CLI's client id>
+export AGENTICWF_RESOURCE=<API resource indicator>          # Logto only
+export AGENTICWF_PAT_TOKEN_TYPE=urn:logto:token-type:personal_access_token   # Logto only (see below)
 ```
 
 Scripts and CI use a personal access token instead (`AGENTICWF_TOKEN=pat_…`), or a machine
-client (`AGENTICWF_CLIENT_ID` + `AGENTICWF_CLIENT_SECRET`).
+client (`AGENTICWF_CLIENT_ID` + `AGENTICWF_CLIENT_SECRET`). A PAT is sent as it is (authsvc resolves
+it: Keycloak), or exchanged for short-lived access tokens when the server publishes a
+`pat_token_type` at `/auth/config` (Logto).
 
 HTTPS: the clients trust the system's CAs plus CERN's, which are installed with the package
 (`agenticwf_auth_cli/cacerts/`), so a server with a CERN certificate works from a machine that

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agenticwf-auth-client"
 version = "0.1.0"
-description = "AgenticWF client: the `agenticwf` command (Logto sign-in, tokens, API calls; `kb` and `agent` commands from their client packages)"
+description = "AgenticWF client: the `agenticwf` command (sign-in through authsvc's identity provider, tokens, API calls; `kb` and `agent` commands from their client packages)"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = []  # standard library only

@@ -60,3 +60,20 @@ def test_update_none_deletes(store):
     store.create(session())
     assert store.update("h1", lambda s: None) is None
     assert store.get("h1") is None
+
+
+def test_personal_token_store():
+    from agenticwf.auth.pats import PersonalToken, PostgresTokenStore, TokenExistsError
+
+    store = PostgresTokenStore(DSN)
+    with store._tx() as cur:
+        cur.execute("TRUNCATE personal_tokens")
+    now = int(time.time())
+    store.add(PersonalToken("h1", "u1", "ci", now, now + 100))
+    with pytest.raises(TokenExistsError):
+        store.add(PersonalToken("h2", "u1", "ci", now, now + 100))
+    store.add(PersonalToken("h3", "u2", "ci", now, now + 100))
+    assert store.find("h1").user_id == "u1" and store.find("nope") is None
+    assert [t.id_hash for t in store.list("u1")] == ["h1"]
+    assert store.remove("u1", "ci") and not store.remove("u1", "ci")
+    assert store.find("h1") is None and store.find("h3") is not None

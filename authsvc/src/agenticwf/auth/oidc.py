@@ -1,22 +1,24 @@
-"""Confidential OIDC client for browser login against Logto (authorization code + PKCE).
+"""Confidential OIDC client for browser login (authorization code + PKCE).
 
-Browser redirects use the public Logto URL; server-to-server calls (token, revocation)
-go to Logto inside the container and present the public host/scheme, as Caddy would.
+Browser redirects use the provider's public endpoints; server-to-server calls (token, revocation)
+go where the provider says (usually inside the container), with its internal headers. The
+endpoints come from the provider package (agenticwf.auth.provider.OIDCEndpoints).
 """
 
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlencode
 
 import httpx
 
 from agenticwf.auth.config import Settings
+from agenticwf.auth.provider import OIDCEndpoints
 
 
 class OIDCError(Exception):
-    """Logto rejected the request (e.g. invalid_grant: refresh token revoked/expired)."""
+    """The provider rejected the request (e.g. invalid_grant: refresh token revoked/expired)."""
 
     def __init__(self, error: str, description: str = ""):
         super().__init__(f"{error}: {description}" if description else error)
@@ -24,7 +26,7 @@ class OIDCError(Exception):
 
 
 class OIDCUnavailableError(Exception):
-    """Logto could not be reached."""
+    """The provider could not be reached."""
 
 
 @dataclass(frozen=True)
@@ -36,16 +38,11 @@ class TokenSet:
     scope: str = ""
 
 
-class LogtoClient:
-    def __init__(self, settings: Settings, http: httpx.Client | None = None):
+class OIDCClient:
+    def __init__(self, settings: Settings, endpoints: OIDCEndpoints, http: httpx.Client | None = None):
         self._s = settings
-        public = urlsplit(settings.logto_endpoint or "")
-        self._http = http or httpx.Client(
-            base_url=settings.logto_internal_url,
-            timeout=10,
-            headers={"Host": public.netloc, "X-Forwarded-Proto": public.scheme or "https",
-                     "X-Forwarded-Host": public.netloc},
-        )
+        self._e = endpoints
+        self._http = http or httpx.Client(timeout=10, headers=dict(endpoints.internal_headers))
 
     @property
     def redirect_uri(self) -> str:
@@ -57,22 +54,21 @@ class LogtoClient:
             "redirect_uri": self.redirect_uri,
             "response_type": "code",
             "scope": self._s.web_scopes,
-            "resource": self._s.resource,
             "state": state,
             "nonce": nonce,
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
-            # Logto only issues refresh tokens (offline_access) with prompt=consent;
-            # first-party apps are consented automatically.
-            "prompt": "consent",
+            **self._e.auth_params,
         }
-        return f"{self._s.logto_endpoint}/oidc/auth?{urlencode(params)}"
+        return f"{self._e.authorization}?{urlencode(params)}"
 
     def end_session_url(self, id_token_hint: str | None) -> str:
+        if not self._e.end_session:
+            return f"{self._s.app_url}/"
         params = {"client_id": self._s.web_client_id, "post_logout_redirect_uri": f"{self._s.app_url}/"}
         if id_token_hint:
             params["id_token_hint"] = id_token_hint
-        return f"{self._s.logto_endpoint}/oidc/session/end?{urlencode(params)}"
+        return f"{self._e.end_session}?{urlencode(params)}"
 
     def exchange_code(self, code: str, code_verifier: str) -> TokenSet:
         return self._token({
@@ -80,16 +76,17 @@ class LogtoClient:
             "code": code,
             "redirect_uri": self.redirect_uri,
             "code_verifier": code_verifier,
-            "resource": self._s.resource,
         })
 
     def refresh(self, refresh_token: str) -> TokenSet:
-        return self._token({"grant_type": "refresh_token", "refresh_token": refresh_token, "resource": self._s.resource})
+        return self._token({"grant_type": "refresh_token", "refresh_token": refresh_token})
 
     def revoke(self, token: str, hint: str = "refresh_token") -> None:
-        """Best effort: logout must not fail because Logto is briefly unreachable."""
+        """Best effort: logout must not fail because the provider is briefly unreachable."""
+        if not self._e.revocation:
+            return
         try:
-            self._http.post("/oidc/token/revocation", data={"token": token, "token_type_hint": hint}, auth=self._auth)
+            self._http.post(self._e.revocation, data={"token": token, "token_type_hint": hint}, auth=self._auth)
         except httpx.HTTPError:
             pass
 
@@ -99,17 +96,20 @@ class LogtoClient:
 
     def _token(self, form: dict[str, str]) -> TokenSet:
         try:
-            response = self._http.post("/oidc/token", data=form, auth=self._auth)
+            response = self._http.post(self._e.token, data={**form, **self._e.token_params}, auth=self._auth)
         except httpx.HTTPError as exc:
             raise OIDCUnavailableError(str(exc)) from exc
         if response.status_code >= 500:
             raise OIDCUnavailableError(f"token endpoint returned {response.status_code}")
-        body = response.json()
+        try:
+            body = response.json()
+        except ValueError:
+            body = {}
         if response.status_code != 200 or "access_token" not in body:
             raise OIDCError(body.get("error", "token_error"), body.get("error_description", ""))
         return TokenSet(
             access_token=body["access_token"],
-            expires_at=int(time.time()) + int(body.get("expires_in", 3600)),
+            expires_at=int(time.time()) + int(body.get("expires_in", 300)),
             refresh_token=body.get("refresh_token"),
             id_token=body.get("id_token"),
             scope=body.get("scope", ""),

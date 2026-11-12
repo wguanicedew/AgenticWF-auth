@@ -6,26 +6,27 @@ Endpoints:
               request with the X-Auth-* headers below; other responses go to the client.
     /whoami   Return the AuthContext of the presented token (debugging / clients).
     /healthz  Liveness.
-    /auth/config  Public: what the `agenticwf` CLI needs besides a credential (Logto URL, the
-              application URL, the CLI app id, the API resource, the scopes to ask for), so a
-              client finds them from a URL.
+    /auth/config  Public: what the `agenticwf` CLI needs besides a credential (the issuer URL, the
+              application URL, the CLI client id, the scopes to ask for, and the provider's extras),
+              so a client finds them from a URL.
     /auth/*   Browser login (see ``agenticwf.auth.web``), when AUTH_WEB_CLIENT_ID is configured.
-    /auth/tokens  Personal access tokens for the CLI (see ``agenticwf.auth.tokens``), when
-              AUTH_MGMT_CLIENT_ID is configured as well.
-    /auth/groups  Groups: Logto organizations, their members and join requests (see
-              ``agenticwf.auth.groups``), with browser login and AUTH_MGMT_CLIENT_ID.
+    /auth/tokens  Personal access tokens for the CLI (see ``agenticwf.auth.tokens``), when the
+              provider offers them.
+    /auth/groups  Groups, their members and join requests (see ``agenticwf.auth.groups``), with
+              browser login and the provider's directory.
 
-With AUTH_MGMT_CLIENT_ID, the AuthContext of a user also carries their username, name and email,
-and their organizations (groups), looked up through the Management API and cached briefly.
+The identity provider plugs in as an ``agenticwf.auth.provider.Provider`` (claims mapping, OIDC
+endpoints, directory, tokens). Provider packages call ``create_app(settings, provider)`` from their
+own factory, e.g. ``uvicorn --factory agenticwf_auth_keycloak:create_app``.
 
-Two kinds of credentials are accepted by /verify:
-    Authorization: Bearer <Logto access token>   CLI tools, scripts, M2M clients
-    __Host-agenticwf_session cookie              browser chat / status pages (incl. SSE, WebSocket)
+Credentials accepted by /verify:
+    Authorization: Bearer <access token>   CLI tools, scripts, machine clients
+    Authorization: Bearer pat_…            personal access tokens, if the provider's TokenBackend
+                                           accepts them (agenticwf.auth.pats)
+    __Host-agenticwf_session cookie        browser chat / status pages (incl. SSE, WebSocket)
 A request carrying a Bearer token is never evaluated against the cookie.
 
 Tracing and metrics: ``agenticwf.auth.telemetry``, off unless an OTLP endpoint is set.
-
-Run with:  uvicorn --factory agenticwf.auth.app:create_app
 """
 
 from __future__ import annotations
@@ -39,7 +40,8 @@ from agenticwf.auth.authn import AuthenticationError, AuthUnavailableError, Toke
 from agenticwf.auth.authz import APPROVAL_PENDING, InvalidPathError, Policy, normalize_path
 from agenticwf.auth.config import Settings
 from agenticwf.auth.context import HEADER_CONTEXT, HEADER_SIGNATURE, AuthContext, encode_context
-from agenticwf.auth.oidc import LogtoClient, OIDCUnavailableError
+from agenticwf.auth.oidc import OIDCClient, OIDCUnavailableError
+from agenticwf.auth.provider import Provider
 from agenticwf.auth.sessions import SessionManager, WebSession, build_store
 from agenticwf.auth import groups, telemetry, tokens, web
 
@@ -70,48 +72,54 @@ def _error(status: int, error: str, description: str, realm: str) -> JSONRespons
 
 def create_app(
     settings: Settings | None = None,
+    provider: Provider | None = None,
     verifier: TokenVerifier | None = None,
     policy: Policy | None = None,
     sessions: SessionManager | None = None,
-    logto: LogtoClient | None = None,
-    management: tokens.ManagementClient | None = None,
+    oidc: OIDCClient | None = None,
     memberships: groups.Memberships | None = None,
     profiles: groups.Profiles | None = None,
     group_requests: groups.RequestStore | None = None,
 ) -> FastAPI:
+    """The auth service for ``provider`` (default: plain OIDC bearer tokens, no browser login)."""
     settings = settings or Settings.from_env()
-    telemetry.setup()  # before the Logto client exists; off unless an OTLP endpoint is set
-    verifier = verifier or TokenVerifier(settings)
+    provider = provider or Provider()
+    telemetry.setup()  # before the OIDC client exists; off unless an OTLP endpoint is set
+    verifier = verifier or TokenVerifier(settings, claims=provider.claims, check_claims=provider.check_claims)
     policy = policy or Policy.load(settings.policy_file)
     if settings.web_enabled and sessions is None:
-        logto = logto or LogtoClient(settings)
-        sessions = SessionManager(build_store(settings.session_store, settings.session_db_url), logto,
+        if oidc is None:
+            if provider.endpoints is None:
+                raise RuntimeError(f"AUTH_WEB_CLIENT_ID is set, but provider {provider.name!r} has no OIDC endpoints")
+            oidc = OIDCClient(settings, provider.endpoints)
+        sessions = SessionManager(build_store(settings.session_store, settings.session_db_url), oidc,
                                   settings.session_idle_ttl, settings.session_max_ttl)
+    directory, personal_tokens = provider.directory, provider.tokens
+    cli_config = {"auth_url": settings.issuer, "api_url": settings.app_url if settings.app_origin else None,
+                  "client_id": settings.cli_client_id, "scopes": settings.cli_scopes, **provider.client_config}
 
     app = FastAPI(title="AgenticWF auth service", docs_url=None, redoc_url=None, openapi_url=None)
     telemetry.instrument_app(app)  # a span per request
     if settings.web_enabled:
         assert sessions is not None
-        app.include_router(web.build_router(settings, sessions, logto or sessions.client, verifier,
-                                            policy.required_scopes))
-    if management is None and settings.mgmt_client_id:
-        management = tokens.ManagementClient(settings)
-    if management is not None and settings.web_enabled:
+        app.include_router(web.build_router(settings, sessions, oidc or sessions.client, verifier,
+                                            policy.required_scopes, provider.return_blocked))
+    if personal_tokens is not None and settings.web_enabled:
         assert sessions is not None
-        app.include_router(tokens.build_router(settings, sessions, verifier, management, policy.required_scopes))
-    if memberships is None and settings.groups_enabled and management is not None:
-        memberships = groups.Memberships(management, settings.group_cache_ttl)
-    if profiles is None and management is not None:
-        profiles = groups.Profiles(management, settings.group_cache_ttl)
-    if memberships is not None and settings.web_enabled:
-        assert sessions is not None and management is not None
+        app.include_router(tokens.build_router(settings, sessions, verifier, personal_tokens, policy.required_scopes,
+                                               {k: v for k, v in cli_config.items() if k != "scopes"}))
+    if memberships is None and directory is not None:
+        memberships = groups.Memberships(directory, settings.group_cache_ttl)
+    if profiles is None and directory is not None and provider.lookup_profiles:
+        profiles = groups.Profiles(directory, settings.group_cache_ttl)
+    if memberships is not None and directory is not None and settings.web_enabled:
+        assert sessions is not None
         group_requests = group_requests or groups.build_request_store(settings.session_store, settings.session_db_url)
-        app.include_router(groups.build_router(settings, sessions, verifier, management, memberships, group_requests,
+        app.include_router(groups.build_router(settings, sessions, verifier, directory, memberships, group_requests,
                                                policy.required_scopes))
 
     def with_groups(ctx: AuthContext) -> AuthContext:
-        """A user's profile (username, name, email) and organizations (groups), for the backends;
-        machines have none."""
+        """A user's groups (and profile, where the token has none), for the backends; machines have none."""
         if ctx.is_machine or ctx.user_id is None:
             return ctx
         if profiles is not None:
@@ -119,17 +127,18 @@ def create_app(
         if memberships is None:
             return ctx
         found = memberships.of(ctx.user_id)
-        return ctx.with_organizations({org_id: m["name"] for org_id, m in found.items()},
-                                      managed=[org_id for org_id, m in found.items() if settings.group_admin_role in m["roles"]])
+        return ctx.with_organizations({group_id: m["name"] for group_id, m in found.items()},
+                                      managed=[group_id for group_id, m in found.items() if m.get("admin")])
 
     def context_from_token(token: str, method: str) -> AuthContext:
-        claims = verifier.verify(token)
-        return AuthContext.from_claims(claims, settings.roles_claim, settings.external_identity_claim).with_method(method)
+        return verifier.context(token, method)
 
     def authenticate(request: Request, method: str) -> tuple[AuthContext | None, bool, WebSession | None]:
         """Return (context, stale_cookie, session). Raises AuthenticationError / CsrfError / *Unavailable."""
         token = extract_bearer(request.headers.get("authorization"))
         if token is not None:
+            if token.startswith(tokens.PAT_PREFIX) and personal_tokens is not None and personal_tokens.accepts_bearer:
+                return personal_tokens.resolve(token), False, None
             return context_from_token(token, "bearer"), False, None
         raw = request.cookies.get(web.SESSION_COOKIE)
         if not (settings.web_enabled and sessions and raw):
@@ -139,7 +148,13 @@ def create_app(
             return None, True, None
         if web.needs_origin_check(method, request.headers) and not web.origin_allowed(request.headers, settings.app_origin or ""):
             raise CsrfError("cross-origin request with session cookie")
-        return context_from_token(session.access_token, "session"), False, session
+        try:
+            return context_from_token(session.access_token, "session"), False, session
+        except AuthenticationError as exc:
+            # Treated like an expired session: /verify sends the browser to sign in (page loads)
+            # or answers 401 (API calls, on which the web UI signs in), clearing the cookie.
+            web.end_rejected_session(sessions, raw, exc)
+            return None, True, None
 
     # Sync handlers: FastAPI runs them in a threadpool, so blocking I/O is fine.
     @app.api_route("/verify", methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
@@ -182,8 +197,18 @@ def create_app(
             telemetry.record_verify(allowed=False, credential=credential, public=is_public,
                                     code="missing_token" if decision.status == 401 else decision.code or "insufficient_scope")
             if decision.status == 401:
-                if settings.web_enabled and web.wants_html(method, request.headers):
-                    response: Response = web.login_redirect(uri, settings.app_base_path)  # page load -> sign in
+                if settings.web_enabled and web.wants_html(method, request.headers) and web.is_login_path(path, settings.app_base_path):
+                    # The proxy sent authsvc's own login endpoints through /verify: redirecting to
+                    # the login would loop (each round nesting return_to, until HTTP 431).
+                    log.error("login endpoint %s reached /verify: the proxy routes {base}/auth/* through forward_auth; "
+                              "APP_BASE_PATH=%r must match the Caddy site (it sends {base}/auth/* to authsvc directly)",
+                              path, settings.app_base_path)
+                    response: Response = _error(500, "proxy_misconfigured",
+                                      f"The sign-in endpoint {path} is routed through authentication; check that "
+                                      f"APP_BASE_PATH ({settings.app_base_path or 'empty'}) matches the reverse proxy's site file.",
+                                      settings.realm)
+                elif settings.web_enabled and web.wants_html(method, request.headers):
+                    response = web.login_redirect(uri, settings.app_base_path)  # page load -> sign in
                 else:
                     response = _error(401, "missing_token", decision.reason, settings.realm)
                 if stale_cookie:
@@ -215,13 +240,16 @@ def create_app(
     @app.get("/whoami")
     def whoami(request: Request) -> Response:
         try:
-            ctx, _, _ = authenticate(request, "GET")
+            ctx, stale_cookie, _ = authenticate(request, "GET")
         except AuthenticationError as exc:
             return _error(401, exc.error, exc.description, settings.realm)
         except (AuthUnavailableError, OIDCUnavailableError):
             return _error(503, "temporarily_unavailable", "Cannot verify credentials right now", settings.realm)
         if ctx is None:
-            return _error(401, "missing_token", "authentication required", settings.realm)
+            response = _error(401, "missing_token", "authentication required", settings.realm)
+            if stale_cookie:
+                web.clear_session_cookie(response)
+            return response
         return JSONResponse({**with_groups(ctx).to_dict(), "approved": policy.is_approved(ctx)})
 
     @app.get("/healthz")
@@ -231,9 +259,7 @@ def create_app(
     @app.get("/auth/config")
     def client_config() -> dict:
         # Not secret: the same values as the AGENTICWF_* settings shown with a new access token.
-        # `scopes` are the browser sign-in's (AUTH_WEB_SCOPES): Logto puts in a token only the API
-        # permissions asked for, so a CLI asking for none would be signed in but not approved.
-        return {"auth_url": settings.logto_endpoint, "api_url": settings.app_url if settings.app_origin else None,
-                "client_id": settings.cli_client_id, "resource": settings.resource, "scopes": settings.web_scopes}
+        # `auth_url` is the issuer; the CLI reads its OIDC discovery document from there.
+        return dict(cli_config)
 
     return app

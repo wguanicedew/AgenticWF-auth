@@ -8,22 +8,23 @@
 #   methods        list of HTTP methods (default: any)
 #   public         true -> no token needed (a valid token still yields an AuthContext)
 #   authenticated  true -> any valid token (documentation only; implied by non-public rules)
-#   scopes         all of these Logto API scopes are required
-#   roles_any      at least one role required (needs the `roles` custom JWT claim)
+#   scopes         all of these API permissions are required
+#   roles_any      at least one role required
 #   organization   true -> token must be organization-scoped (carries an org id)
-#   allow_machine  false -> reject machine-to-machine (client credentials) tokens
+#   allow_machine  false -> reject machine (client credentials, service-account) tokens
 #   allow_pending  true  -> skip `required_scopes` (reachable before approval)
 #
-# Scopes are defined on the Logto API resource (e.g. https://api.example.com) and
-# granted to users through Logto RBAC roles.
+# "Scopes" are the API permissions in the AuthContext; where the provider keeps them (Logto: API
+# resource permissions in `scope`; Keycloak: client roles of the API client) is the provider
+# package's business (AgenticWF-auth-logto / AgenticWF-auth-keycloak). Users get them through roles.
 
 # Credentials: CLI/scripts send `Authorization: Bearer`; browsers use the session cookie
 # from /auth/login (routed by Caddy to authsvc, never through this policy).
 
 # Account approval: every non-public route also needs these scopes. `app:access` is part
-# of every Logto role (researcher, admin, M2M roles); a newly registered user has no role,
+# of every role (researcher, admin, machine roles); a newly registered user has no role,
 # so the token lacks it and requests get 403 approval_pending (browsers see an
-# "awaiting approval" page) until an admin assigns a role. See docs/deployment.md §4.2.
+# "awaiting approval" page) until an admin assigns a role (the provider's deployment docs).
 required_scopes: [app:access]
 
 rules:

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agenticwf-auth-server"
 version = "0.1.0"
-description = "AgenticWF auth service: Logto JWT authentication, policy authorization and AuthContext propagation"
+description = "AgenticWF auth service: provider-neutral JWT authentication, browser sessions, policy authorization and AuthContext propagation"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.110",

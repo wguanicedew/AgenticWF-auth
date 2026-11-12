@@ -1,6 +1,6 @@
 """Server-side browser sessions.
 
-The browser only holds an opaque, HttpOnly session cookie. Logto tokens stay on the
+The browser only holds an opaque, HttpOnly session cookie. provider tokens stay on the
 server, keyed by SHA-256 of the session id (a leaked database does not yield usable
 cookies). Access tokens are refreshed transparently inside ``/verify``, which matters for
 long-lived chat UIs and for SSE/WebSocket clients that cannot attach Authorization headers.
@@ -17,7 +17,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Callable, Iterator, Protocol
 
-from agenticwf.auth.oidc import LogtoClient, OIDCError, TokenSet
+from agenticwf.auth.oidc import OIDCClient, OIDCError, TokenSet
 
 # Refresh access tokens this many seconds before they expire.
 REFRESH_MARGIN = 60
@@ -174,7 +174,7 @@ class PostgresSessionStore:
 
 
 class SessionManager:
-    def __init__(self, store: SessionStore, client: LogtoClient, idle_ttl: int, max_ttl: int,
+    def __init__(self, store: SessionStore, client: OIDCClient, idle_ttl: int, max_ttl: int,
                  clock: Callable[[], float] = time.time):
         self.store = store
         self.client = client
@@ -198,7 +198,7 @@ class SessionManager:
     def resolve(self, raw: str | None) -> WebSession | None:
         """Return a live session with a fresh access token, or None.
 
-        Raises ``OIDCUnavailableError`` if a refresh is needed but Logto is unreachable.
+        Raises ``OIDCUnavailableError`` if a refresh is needed but the provider is unreachable.
         """
         if not raw:
             return None
@@ -220,7 +220,7 @@ class SessionManager:
 
     def refresh_now(self, raw: str | None) -> WebSession | None:
         """Re-issue the access token immediately, e.g. after an admin changed the user's roles
-        (Logto computes the token's scopes from the roles at issuance)."""
+        (the provider puts the current roles, or those still granted, into the new token)."""
         if not raw or self.resolve(raw) is None:
             return None
         return self.store.update(hash_session_id(raw), lambda s: self._refresh(s, force=True))

@@ -11,7 +11,7 @@ from agenticwf.auth.config import Settings
 ISSUER = "https://auth.example.com/oidc"
 AUDIENCE = "https://api.example.com"
 SECRET = b"s" * 48
-POLICY_FILE = Path(__file__).resolve().parents[2] / "container" / "config" / "policy.yaml"
+POLICY_FILE = Path(__file__).resolve().parents[2] / "config" / "policy.yaml"
 
 
 class _Key:
@@ -42,7 +42,7 @@ def private_key():
 
 @pytest.fixture
 def settings():
-    return Settings(issuer=ISSUER, jwks_uri="unused", audiences=(AUDIENCE, "urn:logto:organization:*"),
+    return Settings(issuer=ISSUER, jwks_uri="unused", audiences=(AUDIENCE,),
                     policy_file=POLICY_FILE, context_secret=SECRET)
 
 
@@ -55,10 +55,11 @@ def verifier(settings, private_key):
 
 @pytest.fixture
 def make_token(private_key):
-    def _make(kid="k1", key=None, **overrides):
+    def _make(kid="k1", key=None, scope="app:access dataset:read knowledge:read", **overrides):
+        """A plain OIDC (RFC 9068) access token: `scope` holds the API permissions."""
         now = int(time.time())
         claims = {"iss": ISSUER, "sub": "user_1", "aud": AUDIENCE, "iat": now, "exp": now + 600,
-                  "client_id": "app_1", "scope": "app:access dataset:read knowledge:read", "jti": "t1"}
+                  "client_id": "app_1", "scope": scope, "jti": "t1"}
         claims.update(overrides)
         claims = {k: v for k, v in claims.items() if v is not None}
         return jwt.encode(claims, key or private_key, algorithm="ES384", headers={"kid": kid})

@@ -1,7 +1,7 @@
 """OpenTelemetry tracing and metrics of the auth service (docs/deployment.md, Tracing and metrics).
 
 A span per HTTP request (/verify, /whoami, /auth/*; not /healthz) and per outgoing httpx call
-(Logto's token and revocation endpoints), exported over OTLP/HTTP. Behind Caddy with tracing on,
+(the identity provider's token, revocation and admin endpoints), exported over OTLP/HTTP. Behind Caddy with tracing on,
 the /verify span is a child of Caddy's span for the browser request, next to the backend's.
 
 Needs the `otel` extra (``pip install 'agenticwf-auth-server[otel]'``; the container installs it), and:
@@ -97,7 +97,7 @@ def setup(service: str = SERVICE) -> bool:
         reader = PeriodicExportingMetricReader(OTLPMetricExporter())  # every OTEL_METRIC_EXPORT_INTERVAL (60 s)
         _metrics.set_meter_provider(MeterProvider(resource=resource, metric_readers=[reader]))
         _metering = True
-    try:  # Logto's token and revocation endpoints
+    try:  # the identity provider's token, revocation and admin endpoints
         from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 
         HTTPXClientInstrumentor().instrument()

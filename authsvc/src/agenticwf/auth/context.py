@@ -1,7 +1,7 @@
 """AuthContext: the identity-provider-neutral principal passed to the rest of the system.
 
 Downstream components (REST service, session handler, agent runtime, retriever, tools)
-only ever see an AuthContext; they never parse Logto, INDIGO IAM or CERN SSO tokens.
+only ever see an AuthContext; they never parse Keycloak, Logto, INDIGO IAM or CERN SSO tokens.
 
 Across process boundaries the context travels as two headers:
 
@@ -21,8 +21,6 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from agenticwf.auth.signing import b64d, b64e, mac
-
-ORG_AUDIENCE_PREFIX = "urn:logto:organization:"
 
 HEADER_CONTEXT = "X-Auth-Context"
 HEADER_SIGNATURE = "X-Auth-Context-Sig"
@@ -46,13 +44,14 @@ class AuthContext:
     expires_at: int | None = None
     # "bearer" (Authorization header: CLI, scripts, M2M) or "session" (browser cookie)
     auth_method: str = "bearer"
-    # Every Logto organization the user belongs to, id -> name (groups, agenticwf.auth.groups).
-    # Not in the token: authsvc looks the memberships up, so they apply within a minute.
+    # Every group the user belongs to, id -> name (agenticwf.auth.groups: Keycloak groups, Logto
+    # organizations). Not in the token: authsvc looks the memberships up, so they apply within a
+    # minute. The KB shares with them as `org:<id>`.
     organizations: dict[str, str] = field(default_factory=dict)
-    # The ones of them the user administers (AUTH_GROUP_ADMIN_ROLE): a backend may let them approve
+    # The ones of them the user administers: a backend may let them approve
     # what concerns the group, e.g. the KB's requests to share with it.
     managed_organizations: frozenset[str] = frozenset()
-    # Who the user is, for display: not in the token either; authsvc looks it up (Profiles).
+    # Who the user is, for display: from the token, or looked up by authsvc.
     username: str | None = None
     name: str | None = None
     email: str | None = None
@@ -69,7 +68,7 @@ class AuthContext:
 
     @property
     def is_machine(self) -> bool:
-        """True for Logto machine-to-machine (client credentials) tokens."""
+        """True for tokens without a user (client credentials, service accounts)."""
         return self.user_id is None
 
     def has_scopes(self, *required: str) -> bool:
@@ -85,38 +84,42 @@ class AuthContext:
         roles_claim: str = "roles",
         external_identity_claim: str = "external_identity",
     ) -> "AuthContext":
+        """The context of verified access-token claims, read the plain OIDC / RFC 9068 way.
+
+        ``scopes``: the ``scope`` claim. ``roles``: the claim at the dotted path ``roles_claim``.
+        A token whose ``sub`` is its ``client_id`` (client credentials) has no user. Provider
+        packages map their own tokens (agenticwf.auth.provider.Provider.claims).
+        """
         aud = claims.get("aud")
         audience = (aud,) if isinstance(aud, str) else tuple(aud or ())
 
-        organization_id = claims.get("organization_id")
-        if not organization_id:
-            # Logto organization tokens carry the org in the audience.
-            organization_id = next(
-                (a[len(ORG_AUDIENCE_PREFIX):] for a in audience if a.startswith(ORG_AUDIENCE_PREFIX)),
-                None,
-            )
-
         sub = claims["sub"]
-        client_id = claims.get("client_id")
-        # Logto M2M tokens use the application id as `sub`.
-        user_id = None if client_id and sub == client_id else sub
+        client_id = claims.get("client_id") or claims.get("azp")
+        is_machine = bool(claims.get("client_id")) and sub == claims.get("client_id")
 
-        raw_roles = claims.get(roles_claim) or []
+        raw_roles = claim(claims, roles_claim) or []
         if isinstance(raw_roles, str):
             raw_roles = raw_roles.split()
 
         external = claims.get(external_identity_claim)
+        email = claims.get("email")
+        username = claims.get("preferred_username") or claims.get("username")
         return cls(
             subject=sub,
-            user_id=user_id,
+            user_id=None if is_machine else sub,
             client_id=client_id,
-            organization_id=organization_id,
-            roles=frozenset(raw_roles),
+            organization_id=claims.get("organization_id"),
+            roles=frozenset(str(r) for r in raw_roles),
             scopes=frozenset((claims.get("scope") or "").split()),
             audience=audience,
             external_identity=external if isinstance(external, dict) else None,
             token_id=claims.get("jti"),
             expires_at=claims.get("exp"),
+            # Who the user is, for display, when the token says it; the email stands in for a
+            # missing username, so `username` always names a person.
+            username=None if is_machine else (username or email or None),
+            name=None if is_machine else (claims.get("name") or None),
+            email=None if is_machine else (email or None),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -211,3 +214,15 @@ def decode_context(
     if path is not None and req.get("path") != path:
         raise ContextError("auth context issued for a different path")
     return AuthContext.from_dict(body["ctx"])
+
+
+def claim(claims: dict[str, Any], path: str) -> Any:
+    """The claim at a dotted path, e.g. ``realm_access.roles``; a claim whose own name has dots wins."""
+    if path in claims:
+        return claims[path]
+    value: Any = claims
+    for part in path.split("."):
+        if not isinstance(value, dict):
+            return None
+        value = value.get(part)
+    return value

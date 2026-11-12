@@ -1,10 +1,16 @@
-"""Settings loaded from environment variables."""
+"""Settings loaded from environment variables.
+
+Only provider-neutral settings live here. A provider package reads its own (KEYCLOAK_*, LOGTO_*)
+and passes what follows from them as defaults: ``Settings.from_env(issuer=..., jwks_uri=...)``.
+An AUTH_* variable that is set always wins over such a default.
+"""
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 def _env(name: str, default: str | None = None) -> str | None:
@@ -25,13 +31,11 @@ def read_secret(name: str) -> str | None:
 
 @dataclass(frozen=True)
 class Settings:
-    # Public Logto issuer, e.g. https://auth.example.com/oidc. Must match the `iss` claim.
+    # Expected `iss` of access tokens (the provider's public issuer URL).
     issuer: str
-    # Where to fetch signing keys. Defaults to Logto inside the same container, so
-    # key fetches do not hairpin through Caddy.
+    # Where to fetch signing keys; usually the provider inside the same container.
     jwks_uri: str
-    # Accepted `aud` values (Logto API resource indicators). A trailing `*` is a prefix
-    # match, e.g. `urn:logto:organization:*` for organization tokens.
+    # Accepted `aud` values. A trailing `*` is a prefix match.
     audiences: tuple[str, ...]
     policy_file: Path
     # HMAC secret used to sign the AuthContext handed to backend services.
@@ -39,55 +43,41 @@ class Settings:
     context_ttl: int = 60
     jwks_cache_ttl: int = 300
     leeway: int = 30
-    roles_claim: str = "roles"
+    # Claims read by the generic mapping (AuthContext.from_claims); providers may map otherwise.
+    roles_claim: str = "roles"  # dotted path, e.g. realm_access.roles
     external_identity_claim: str = "external_identity"
-    realm: str = "agenticwf"
+    realm: str = "agenticwf"  # WWW-Authenticate realm
 
     # --- Browser (cookie session) login; enabled when web_client_id is set ----------
-    # Logto "Traditional web" application acting as a confidential client.
-    logto_endpoint: str | None = None  # public, used for browser redirects
-    logto_internal_url: str = "http://127.0.0.1:3001"  # server-to-server calls
+    # A confidential OIDC client of the provider (authorization code + PKCE).
     web_client_id: str | None = None
     web_client_secret: str | None = None
     app_origin: str | None = None  # e.g. https://app.example.org (scheme + host, no path)
-    # Path prefix of the application on that origin, e.g. "/app" when Logto owns "/" of a
-    # single shared hostname. Caddy strips it before authsvc/backend see the request.
+    # Path prefix of the application on that origin, e.g. "/app" when another service owns "/"
+    # of a shared hostname. Caddy strips it before authsvc/backend see the request.
     app_base_path: str = ""
-    web_scopes: str = "openid profile email offline_access"
-    web_resource: str | None = None  # defaults to the first non-wildcard audience
+    web_scopes: str = "openid profile email"
     session_store: str = "postgres"  # or "memory" (single process, development)
     session_db_url: str | None = None
     session_idle_ttl: int = 8 * 3600
     session_max_ttl: int = 7 * 24 * 3600
-    # Where users edit their own profile, e.g. Logto's Account Center ${LOGTO_ENDPOINT}/account;
-    # the web UI links to it when set.
+    # Where users edit their own profile; the web UI links to it when set.
     account_url: str | None = None
 
-    # --- Personal access tokens (/auth/tokens); enabled with browser login and mgmt_client_id
-    # Logto "Machine-to-machine" app holding the "Logto Management API access" role.
+    # --- The provider's admin API: groups (/auth/groups), personal access tokens (/auth/tokens)
     mgmt_client_id: str | None = None
     mgmt_client_secret: str | None = None
-    mgmt_resource: str = "https://default.logto.app/api"  # Logto OSS Management API
-    cli_client_id: str | None = None  # Logto Native app the CLI uses; shown to users
+    cli_client_id: str | None = None  # client of `agenticwf login` (device flow); published
+    cli_scopes: str = "openid offline_access"  # what the CLI asks for; published
     pat_max_days: int = 365
-
-    # --- Groups (/auth/groups): Logto organizations, managed through the same Management API app.
-    # Members' organizations reach the backends in the AuthContext (the KB shares with org:<id>).
-    group_admin_role: str = "admin"    # organization role of a group's admins
-    group_member_role: str = "member"  # organization role given to the members they add
-    group_cache_ttl: int = 60          # seconds a user's memberships are cached (per worker)
+    group_cache_ttl: int = 60  # seconds a user's groups (and profile, PAT roles) are cached
 
     @property
     def web_enabled(self) -> bool:
         return bool(self.web_client_id)
 
     @property
-    def tokens_enabled(self) -> bool:
-        return self.web_enabled and bool(self.mgmt_client_id)
-
-    @property
-    def groups_enabled(self) -> bool:
-        """Memberships are looked up (and /auth/groups served, with browser login)."""
+    def management_enabled(self) -> bool:
         return bool(self.mgmt_client_id)
 
     @property
@@ -96,67 +86,74 @@ class Settings:
         return f"{self.app_origin}{self.app_base_path}"
 
     @property
-    def resource(self) -> str:
-        return self.web_resource or next(a for a in self.audiences if not a.endswith("*"))
+    def default_audience(self) -> str | None:
+        return next((a for a in self.audiences if not a.endswith("*")), None)
 
     @classmethod
-    def from_env(cls) -> "Settings":
-        endpoint = _env("LOGTO_ENDPOINT")
-        issuer = _env("AUTH_ISSUER") or (f"{endpoint.rstrip('/')}/oidc" if endpoint else None)
-        if not issuer:
-            raise RuntimeError("Set LOGTO_ENDPOINT (public Logto URL) or AUTH_ISSUER")
+    def from_env(cls, **defaults: Any) -> "Settings":
+        """Settings from AUTH_* / APP_* variables; ``defaults`` (field names) fill what is unset."""
+        def get(env: str, field: str, fallback: Any = None) -> Any:
+            return _env(env) or defaults.get(field) or fallback
 
-        audiences = tuple(a for a in (_env("AUTH_AUDIENCES", "") or "").replace(",", " ").split() if a)
+        def number(env: str, field: str, fallback: int) -> int:
+            return int(get(env, field, fallback))
+
+        issuer = (get("AUTH_ISSUER", "issuer") or "").rstrip("/")
+        if not issuer:
+            raise RuntimeError("Set AUTH_ISSUER (or the provider's settings it is derived from)")
+        jwks_uri = get("AUTH_JWKS_URI", "jwks_uri")
+        if not jwks_uri:
+            raise RuntimeError("Set AUTH_JWKS_URI (or the provider's settings it is derived from)")
+
+        raw_aud = get("AUTH_AUDIENCES", "audiences", "")
+        if not isinstance(raw_aud, str):
+            raw_aud = " ".join(raw_aud)
+        audiences = tuple(a for a in raw_aud.replace(",", " ").split() if a)
         if not audiences:
-            raise RuntimeError("Set AUTH_AUDIENCES to the Logto API resource indicator(s)")
+            raise RuntimeError("Set AUTH_AUDIENCES to the audience(s) of the API's access tokens")
 
         secret = read_secret("AUTH_CONTEXT_SECRET")
         if not secret or len(secret) < 32:
             raise RuntimeError("AUTH_CONTEXT_SECRET(_FILE) must provide at least 32 characters")
 
-        web_client_id = _env("AUTH_WEB_CLIENT_ID")
+        web_client_id = get("AUTH_WEB_CLIENT_ID", "web_client_id")
         app_origin = (_env("APP_ORIGIN") or "").rstrip("/") or None
         base_path = (_env("APP_BASE_PATH") or "").strip("/")
         base_path = f"/{base_path}" if base_path else ""
         web_client_secret = read_secret("AUTH_WEB_CLIENT_SECRET")
-        if web_client_id and not (endpoint and app_origin and web_client_secret):
-            raise RuntimeError("Browser login needs LOGTO_ENDPOINT, APP_ORIGIN and AUTH_WEB_CLIENT_SECRET(_FILE)")
-        mgmt_client_id = _env("AUTH_MGMT_CLIENT_ID")
+        if web_client_id and not (app_origin and web_client_secret):
+            raise RuntimeError("Browser login needs APP_ORIGIN and AUTH_WEB_CLIENT_SECRET(_FILE)")
+        mgmt_client_id = get("AUTH_MGMT_CLIENT_ID", "mgmt_client_id")
         mgmt_client_secret = read_secret("AUTH_MGMT_CLIENT_SECRET")
         if mgmt_client_id and not mgmt_client_secret:
             raise RuntimeError("AUTH_MGMT_CLIENT_ID needs AUTH_MGMT_CLIENT_SECRET(_FILE)")
 
         return cls(
             issuer=issuer,
-            jwks_uri=_env("AUTH_JWKS_URI", "http://127.0.0.1:3001/oidc/jwks"),
+            jwks_uri=jwks_uri,
             audiences=audiences,
-            policy_file=Path(_env("AUTH_POLICY_FILE", "/etc/agenticwf/policy.yaml")),
+            policy_file=Path(get("AUTH_POLICY_FILE", "policy_file", "/etc/agenticwf/policy.yaml")),
             context_secret=secret.encode(),
-            context_ttl=int(_env("AUTH_CONTEXT_TTL", "60")),
-            jwks_cache_ttl=int(_env("AUTH_JWKS_CACHE_TTL", "300")),
-            leeway=int(_env("AUTH_LEEWAY", "30")),
-            roles_claim=_env("AUTH_ROLES_CLAIM", "roles"),
-            external_identity_claim=_env("AUTH_EXTERNAL_IDENTITY_CLAIM", "external_identity"),
-            realm=_env("AUTH_REALM", "agenticwf"),
-            logto_endpoint=endpoint.rstrip("/") if endpoint else None,
-            logto_internal_url=_env("LOGTO_INTERNAL_URL", "http://127.0.0.1:3001").rstrip("/"),
+            context_ttl=number("AUTH_CONTEXT_TTL", "context_ttl", 60),
+            jwks_cache_ttl=number("AUTH_JWKS_CACHE_TTL", "jwks_cache_ttl", 300),
+            leeway=number("AUTH_LEEWAY", "leeway", 30),
+            roles_claim=get("AUTH_ROLES_CLAIM", "roles_claim", "roles"),
+            external_identity_claim=get("AUTH_EXTERNAL_IDENTITY_CLAIM", "external_identity_claim", "external_identity"),
+            realm=get("AUTH_REALM", "realm", "agenticwf"),
             web_client_id=web_client_id,
             web_client_secret=web_client_secret,
             app_origin=app_origin,
             app_base_path=base_path,
-            web_scopes=_env("AUTH_WEB_SCOPES", "openid profile email offline_access"),
-            web_resource=_env("AUTH_WEB_RESOURCE"),
-            session_store=_env("AUTH_SESSION_STORE", "postgres"),
+            web_scopes=get("AUTH_WEB_SCOPES", "web_scopes", "openid profile email"),
+            session_store=get("AUTH_SESSION_STORE", "session_store", "postgres"),
             session_db_url=read_secret("AUTH_SESSION_DB_URL"),
-            session_idle_ttl=int(_env("AUTH_SESSION_IDLE_TTL", str(8 * 3600))),
-            session_max_ttl=int(_env("AUTH_SESSION_MAX_TTL", str(7 * 24 * 3600))),
-            account_url=(_env("AUTH_ACCOUNT_URL") or "").rstrip("/") or None,
+            session_idle_ttl=number("AUTH_SESSION_IDLE_TTL", "session_idle_ttl", 8 * 3600),
+            session_max_ttl=number("AUTH_SESSION_MAX_TTL", "session_max_ttl", 7 * 24 * 3600),
+            account_url=(get("AUTH_ACCOUNT_URL", "account_url") or "").rstrip("/") or None,
             mgmt_client_id=mgmt_client_id,
             mgmt_client_secret=mgmt_client_secret,
-            mgmt_resource=_env("AUTH_MGMT_RESOURCE", "https://default.logto.app/api"),
-            cli_client_id=_env("AUTH_CLI_CLIENT_ID"),
-            pat_max_days=int(_env("AUTH_PAT_MAX_DAYS", "365")),
-            group_admin_role=_env("AUTH_GROUP_ADMIN_ROLE", "admin"),
-            group_member_role=_env("AUTH_GROUP_MEMBER_ROLE", "member"),
-            group_cache_ttl=int(_env("AUTH_GROUP_CACHE_TTL", "60")),
+            cli_client_id=get("AUTH_CLI_CLIENT_ID", "cli_client_id"),
+            cli_scopes=get("AUTH_CLI_SCOPES", "cli_scopes", "openid offline_access"),
+            pat_max_days=number("AUTH_PAT_MAX_DAYS", "pat_max_days", 365),
+            group_cache_ttl=number("AUTH_GROUP_CACHE_TTL", "group_cache_ttl", 60),
         )
